@@ -6,6 +6,14 @@
 
 项目提供一键安装脚本，可自动将程序部署到 `/opt/azure_ip`，创建并启动 `systemd` 服务，使监控程序在后台持续运行并随系统启动。
 
+## 一键安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Assute/azure_ip/main/azure_ip.sh | sudo bash
+```
+
+安装完成后，监控程序会在后台持续运行，并随系统自动启动。
+
 ## 功能特点
 
 - 一条命令完成下载、配置、安装和后台启动
@@ -65,7 +73,7 @@ systemd 后台运行
 - `Client Secret`：客户端密钥值
 - `Tenant ID`：目录（租户）ID
 
-## 一键安装
+## 详细安装说明
 
 在 Linux 服务器中执行：
 
