@@ -19,6 +19,7 @@ Azure 公网 IP 监控器一键安装脚本
 用法：
   sudo bash azure_ip.sh                 安装或更新，并启动后台服务
   sudo bash azure_ip.sh --reconfigure   重新填写 Azure 配置并重启服务
+  sudo bash azure_ip.sh --delete-config 删除配置并停止后台服务
   bash azure_ip.sh --status             查看服务状态
   bash azure_ip.sh --logs               持续查看服务日志
   bash azure_ip.sh --help               显示帮助
@@ -32,6 +33,9 @@ for argument in "$@"; do
     case "${argument}" in
         --reconfigure)
             action="reconfigure"
+            ;;
+        --delete-config)
+            action="delete-config"
             ;;
         --status)
             action="status"
@@ -58,6 +62,39 @@ require_command() {
     fi
 }
 
+choose_existing_config_action() {
+    local choice
+
+    while true; do
+        cat >/dev/tty <<EOF
+
+检测到已有配置：${CONFIG_FILE}
+请选择操作：
+  1. 重新配置
+  2. 删除配置并停止后台服务
+  3. 保留配置，更新程序并重启服务（默认）
+EOF
+        read -r -p "请输入选项 [1/2/3]：" choice </dev/tty || choice="3"
+        case "${choice}" in
+            1)
+                action="reconfigure"
+                return
+                ;;
+            2)
+                action="delete-config"
+                return
+                ;;
+            3|"")
+                action="install"
+                return
+                ;;
+            *)
+                echo "无效选项，请输入 1、2 或 3。" >/dev/tty
+                ;;
+        esac
+    done
+}
+
 case "${action}" in
     status)
         require_command systemctl
@@ -74,9 +111,32 @@ if [[ "${EUID}" -ne 0 ]]; then
     exit 1
 fi
 
+require_command systemctl
+
+if [[ "${action}" == "install" && -f "${CONFIG_FILE}" ]]; then
+    if [[ -r /dev/tty ]]; then
+        choose_existing_config_action
+    else
+        echo "检测到现有配置，非交互运行将保留配置并继续更新。"
+    fi
+fi
+
+if [[ "${action}" == "delete-config" ]]; then
+    systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        if ! command -v shred >/dev/null 2>&1 || ! shred -u "${CONFIG_FILE}"; then
+            rm -f "${CONFIG_FILE}"
+        fi
+        echo "配置已删除：${CONFIG_FILE}"
+    else
+        echo "未找到配置文件：${CONFIG_FILE}"
+    fi
+    echo "后台服务已停止并禁用。再次运行安装脚本可重新配置。"
+    exit 0
+fi
+
 require_command python3
 require_command ping
-require_command systemctl
 
 if command -v curl >/dev/null 2>&1; then
     downloader="curl"

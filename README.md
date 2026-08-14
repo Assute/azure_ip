@@ -101,6 +101,16 @@ sudo bash azure_ip.sh
 
 安装完成后，即使退出 SSH，程序也会继续在后台运行；服务器重启后服务会自动启动。
 
+再次运行安装脚本并检测到已有配置时，会显示以下菜单：
+
+```text
+1. 重新配置
+2. 删除配置并停止后台服务
+3. 保留配置，更新程序并重启服务（默认）
+```
+
+选择 `2` 后，脚本会先停止并禁用 `azure-ip-monitor.service`，然后安全删除包含 Azure 凭据的配置文件。之后再次运行安装脚本即可重新配置。
+
 ## 管理命令
 
 ```bash
@@ -115,6 +125,9 @@ sudo /opt/azure_ip/azure_ip.sh
 
 # 重新填写 Azure 凭据和选择虚拟机
 sudo /opt/azure_ip/azure_ip.sh --reconfigure
+
+# 不显示菜单，直接删除配置并停止后台服务
+sudo /opt/azure_ip/azure_ip.sh --delete-config
 ```
 
 也可以直接使用 `systemctl`：
