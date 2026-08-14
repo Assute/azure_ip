@@ -1,0 +1,21 @@
+# Azure credentials and local configuration
+azure_ip_monitor.json
+azure_ip_monitor.json.tmp
+*.secret.json
+
+# Runtime output
+*.log
+*.pid
+nohup.out
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
