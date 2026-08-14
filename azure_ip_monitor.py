@@ -137,7 +137,7 @@ def prompt_text(label: str, default: str | None = None, secret: bool = False) ->
 
 def configure(path: Path) -> Config:
     if not sys.stdin.isatty():
-        raise MonitorError("缺少配置且当前不是交互终端，请在终端中运行 ./ping_self.sh --configure")
+        raise MonitorError("缺少配置且当前不是交互终端，请在交互终端中运行配置命令")
 
     print("首次运行，只需填写 Azure 应用凭据。")
     print("脚本会自动发现订阅、资源组、虚拟机和公网 IP。")
@@ -668,6 +668,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Azure 公网 IP 故障监控与自动更换")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="配置文件路径")
     parser.add_argument("--configure", action="store_true", help="重新填写并保存配置")
+    parser.add_argument("--configure-only", action="store_true", help="完成配置后退出，不启动监控")
     parser.add_argument("--once", action="store_true", help="只检测一次，不更换 IP")
     parser.add_argument("--rotate-now", action="store_true", help="立即更换公网 IP")
     parser.add_argument("--dry-run", action="store_true", help="达到阈值时只提示，不修改 Azure 资源")
@@ -681,7 +682,10 @@ def main() -> int:
         return 2
 
     try:
-        config = configure(args.config) if args.configure or not args.config.exists() else load_config(args.config)
+        should_configure = args.configure or args.configure_only or not args.config.exists()
+        config = configure(args.config) if should_configure else load_config(args.config)
+        if args.configure_only:
+            return 0
         client = AzureClient(config)
         if args.rotate_now:
             resources = discover_resources(client, config)
