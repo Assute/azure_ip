@@ -20,7 +20,8 @@ curl -fsSL https://raw.githubusercontent.com/Assute/azure_ip/main/azure_ip.sh | 
 - 自动部署到 `/opt/azure_ip`
 - 自动创建并启用 `systemd` 后台服务
 - 定时检测 Azure VM 公网 IP 的 ICMP 可达性
-- 连续失败达到阈值后自动更换公网 IP
+- 常规监控连续失败达到阈值后自动更换公网 IP
+- 新 IP 绑定后等待 2 秒检测，失败一次立即继续更换，直到恢复正常
 - 自动发现订阅、资源组、虚拟机、主网卡和公网 IP
 - 自动识别 Azure 全球区和 Azure 中国区
 - 创建新 IP 时尽量保留原资源的 SKU、区域、可用区、标签和超时设置
@@ -184,7 +185,6 @@ sudo systemctl stop azure-ip-monitor
 | `ping_timeout` | `3` | 单次 Ping 超时时间，单位为秒 |
 | `check_interval` | `10` | 两次检测之间的间隔，单位为秒 |
 | `failure_threshold` | `3` | 连续失败多少次后更换 IP |
-| `rotation_cooldown` | `60` | 更换完成后的等待时间，单位为秒 |
 | `delete_old_ip` | `true` | 切换成功后是否删除旧公网 IP 资源 |
 
 如需保留旧公网 IP，可将现有配置中的字段修改为：
@@ -192,6 +192,8 @@ sudo systemctl stop azure-ip-monitor
 ```json
 "delete_old_ip": false
 ```
+
+公网 IP 更换后的恢复检测固定等待 `2` 秒，不受配置文件控制。新 IP 如果第一次 Ping 就超时，程序会立即继续创建并切换下一个 IP，直到检测正常，然后恢复上表所示的常规检测间隔和失败阈值。
 
 修改配置后重启服务：
 

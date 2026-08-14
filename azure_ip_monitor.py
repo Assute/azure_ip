@@ -25,6 +25,7 @@ DEFAULT_CONFIG = SCRIPT_DIR / "azure_ip_monitor.json"
 COMPUTE_API = "2024-11-01"
 NETWORK_API = "2024-05-01"
 SUBSCRIPTIONS_API = "2022-12-01"
+POST_ROTATION_CHECK_DELAY = 2
 
 CLOUDS = {
     "global": {
@@ -56,7 +57,6 @@ class Config:
     ping_timeout: int = 3
     check_interval: int = 10
     failure_threshold: int = 3
-    rotation_cooldown: int = 60
     delete_old_ip: bool = True
 
     @classmethod
@@ -86,7 +86,6 @@ class Config:
             ping_timeout=positive_int(data.get("ping_timeout", 3), "ping_timeout"),
             check_interval=positive_int(data.get("check_interval", 10), "check_interval"),
             failure_threshold=positive_int(data.get("failure_threshold", 3), "failure_threshold"),
-            rotation_cooldown=positive_int(data.get("rotation_cooldown", 60), "rotation_cooldown"),
             delete_old_ip=bool(data.get("delete_old_ip", True)),
         )
 
@@ -163,7 +162,7 @@ def configure(path: Path) -> Config:
         f"已选择：{choice.vm_name} / {choice.resource_group} / "
         f"{choice.subscription_name} / {choice.public_ip_address}"
     )
-    print("监控参数：每 10 秒检测，单次超时 3 秒，连续失败 3 次后更换 IP。")
+    print("监控参数：每 10 秒检测，单次超时 3 秒，连续失败 3 次后更换 IP；换 IP 后每 2 秒验证，失败一次立即继续更换。")
     print(f"配置已保存到 {path}（权限 600）。")
     return config
 
@@ -181,7 +180,6 @@ def save_config(path: Path, config: Config) -> None:
         "ping_timeout": config.ping_timeout,
         "check_interval": config.check_interval,
         "failure_threshold": config.failure_threshold,
-        "rotation_cooldown": config.rotation_cooldown,
         "delete_old_ip": config.delete_old_ip,
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -625,6 +623,32 @@ def ping_once(address: str, timeout: int) -> bool:
     return result.returncode == 0
 
 
+def rotate_until_reachable(
+    client: AzureClient,
+    config: Config,
+    resources: AzureResources,
+) -> AzureResources:
+    while True:
+        resources = rotate_public_ip(client, resources, config.delete_old_ip)
+        print(
+            f"[{timestamp()}] 等待 {POST_ROTATION_CHECK_DELAY} 秒后检测新公网 IP；"
+            "如超时将立即继续更换",
+            flush=True,
+        )
+        time.sleep(POST_ROTATION_CHECK_DELAY)
+        if ping_once(resources.public_ip_address, config.ping_timeout):
+            print(
+                f"[{timestamp()}] 新公网 IP {resources.public_ip_address} 检测正常，恢复常规监控",
+                flush=True,
+            )
+            return resources
+        print(
+            f"[{timestamp()}] 新公网 IP {resources.public_ip_address} Ping 超时，立即继续更换",
+            flush=True,
+        )
+        resources = discover_resources(client, config)
+
+
 def monitor(client: AzureClient, config: Config, once: bool = False, dry_run: bool = False) -> int:
     resources = discover_resources(client, config)
     print(
@@ -654,12 +678,9 @@ def monitor(client: AzureClient, config: Config, once: bool = False, dry_run: bo
                 print(f"[{timestamp()}] [演练] 已达到阈值，本应更换公网 IP；未修改 Azure 资源", flush=True)
                 failures = 0
             else:
-                # Refresh the association in case it changed outside this process.
                 resources = discover_resources(client, config)
-                resources = rotate_public_ip(client, resources, config.delete_old_ip)
+                resources = rotate_until_reachable(client, config, resources)
                 failures = 0
-                print(f"[{timestamp()}] 等待 {config.rotation_cooldown} 秒后恢复检测", flush=True)
-                time.sleep(config.rotation_cooldown)
 
         time.sleep(config.check_interval)
 
@@ -690,7 +711,7 @@ def main() -> int:
         if args.rotate_now:
             resources = discover_resources(client, config)
             print(f"当前公网 IP：{resources.public_ip_address}")
-            rotate_public_ip(client, resources, config.delete_old_ip)
+            rotate_until_reachable(client, config, resources)
             return 0
         return monitor(client, config, once=args.once, dry_run=args.dry_run)
     except KeyboardInterrupt:
