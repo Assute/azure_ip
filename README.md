@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/Assute/azure_ip/main/azure_ip.sh | 
 - 自动部署到 `/opt/azure_ip`
 - 自动创建并启用 `systemd` 后台服务
 - 使用 Bash `/dev/tcp` 检测 `gd-cu-v4.ip.zstaticcdn.com:80` 的 TCP 连通性
-- 常规监控连续失败达到阈值后自动更换公网 IP
+- 常规检测失败后立即复检，默认连续失败 3 次后更换公网 IP
 - 新 IP 绑定后等待 2 秒检测 TCP，失败一次立即继续更换，直到恢复正常
 - 自动发现订阅、资源组、虚拟机、主网卡和公网 IP
 - 自动识别 Azure 全球区和 Azure 中国区
@@ -36,11 +36,11 @@ systemd 后台运行
        │
        └── TCP 检测 gd-cu-v4.ip.zstaticcdn.com:80
                     │
-                    ├── 连接正常 ──> 清零失败次数并继续检测
+                    ├── 连接正常 ──> 清零失败次数，等待常规间隔
                     │
-                    └── 连接超时 ──> 累计失败次数
+                    └── 连接超时 ──> 不等待，立即再次检测
                                            │
-                                           └── 达到阈值
+                                           └── 连续 3 次失败
                                                   ├── 创建并绑定新公网 IP
                                                   ├── 等待 2 秒再次检测 TCP
                                                   ├── 超时一次立即继续换 IP
@@ -179,7 +179,7 @@ sudo systemctl stop azure-ip-monitor
 | 字段 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `tcp_timeout` | `3` | 单次 TCP 连接超时时间，单位为秒 |
-| `check_interval` | `10` | 两次检测之间的间隔，单位为秒 |
+| `check_interval` | `10` | 检测正常后到下一次常规检测的间隔，单位为秒；失败复检不等待 |
 | `failure_threshold` | `3` | 连续失败多少次后更换 IP |
 | `delete_old_ip` | `true` | 切换成功后是否删除旧公网 IP 资源 |
 
@@ -189,7 +189,7 @@ sudo systemctl stop azure-ip-monitor
 "delete_old_ip": false
 ```
 
-公网 IP 更换后的恢复检测固定等待 `2` 秒，不受配置文件控制。新 IP 如果第一次连接 `gd-cu-v4.ip.zstaticcdn.com:80` 就超时，程序会立即继续创建并切换下一个 IP，直到 TCP 检测正常，然后恢复上表所示的常规检测间隔和失败阈值。旧配置中的 `ping_timeout` 会自动作为 `tcp_timeout` 读取，无需重新配置。
+常规检测一旦失败会立即进行下一次检测，不等待 `check_interval`；默认连续失败 `3` 次后更换公网 IP。公网 IP 更换后的恢复检测固定等待 `2` 秒，不受配置文件控制。新 IP 如果第一次连接 `gd-cu-v4.ip.zstaticcdn.com:80` 就超时，程序会立即继续创建并切换下一个 IP，直到 TCP 检测正常，然后恢复上表所示的常规检测间隔和失败阈值。旧配置中的 `ping_timeout` 会自动作为 `tcp_timeout` 读取，无需重新配置。
 
 修改配置后重启服务：
 

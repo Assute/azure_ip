@@ -695,8 +695,13 @@ def monitor(client: AzureClient, config: Config, once: bool = False) -> int:
             resources = discover_resources(client, config)
             resources = rotate_until_reachable(client, config, resources)
             failures = 0
+            time.sleep(config.check_interval)
+            continue
 
-        time.sleep(config.check_interval)
+        if reachable:
+            time.sleep(config.check_interval)
+        else:
+            print(f"[{timestamp()}] 未达到换 IP 阈值，立即进行下一次检测", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
