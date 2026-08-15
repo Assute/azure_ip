@@ -2,7 +2,7 @@
 
 一个轻量、零第三方 Python 依赖的 Azure 虚拟机公网 IP 监控工具。
 
-程序会通过当前 Azure 公网 IP 定时检测 `gd-cu-v4.ip.zstaticcdn.com:80` 的 TCP 连通性；当连续检测失败达到设定阈值后，自动创建新的 Azure 公网 IP、更新网卡绑定，并在确认切换成功后删除旧公网 IP 资源。
+程序会通过当前 Azure 公网 IP 定时检测 `gd-cu-v4.ip.zstaticcdn.com:80` 的 TCP 连通性；当连续检测失败达到设定阈值后，自动创建新的 Azure 公网 IP、更新网卡绑定，绑定新 IP 时保留旧公网 IP，确认新 IP 的 TCP 检测正常后才删除旧资源。
 
 项目提供一键安装脚本，可自动将程序部署到 `/opt/azure_ip`，创建并启动 `systemd` 服务，使监控程序在后台持续运行并随系统启动。
 
@@ -25,7 +25,8 @@ curl -fsSL https://raw.githubusercontent.com/Assute/azure_ip/main/azure_ip.sh | 
 - 自动发现订阅、资源组、虚拟机、主网卡和公网 IP
 - 自动识别 Azure 全球区和 Azure 中国区
 - 创建新 IP 时尽量保留原资源的 SKU、区域、可用区、标签和超时设置
-- 新 IP 绑定验证成功后再删除旧 IP，降低误删除风险
+- 最初旧 IP 保留到新 IP 的 TCP 检测正常后才删除，降低误删除风险
+- 检测失败的候选 IP 在下一个候选绑定后立即删除，避免资源堆积
 - 支持保留旧公网 IP、单次检测和立即更换模式
 - 仅使用 Python 标准库，无需安装 Azure CLI 或第三方 Python 包
 
@@ -41,10 +42,11 @@ systemd 后台运行
                     └── 连接超时 ──> 不等待，立即再次检测
                                            │
                                            └── 连续 3 次失败
-                                                  ├── 创建并绑定新公网 IP
+                                                  ├── 保留最初旧公网 IP
+                                                  ├── 创建并绑定候选新 IP
                                                   ├── 等待 5 秒再次检测 TCP
-                                                  ├── 超时一次立即继续换 IP
-                                                  └── 正常后恢复常规检测
+                                                  ├── 候选失败：绑定下一个后立即删除失败 IP
+                                                  └── 候选正常：删除最初旧 IP并恢复监控
 ```
 
 ## 环境要求
@@ -181,7 +183,7 @@ sudo systemctl stop azure-ip-monitor
 | `tcp_timeout` | `3` | 单次 TCP 连接超时时间，单位为秒 |
 | `check_interval` | `10` | 检测正常后到下一次常规检测的间隔，单位为秒；失败复检不等待 |
 | `failure_threshold` | `3` | 连续失败多少次后更换 IP |
-| `delete_old_ip` | `true` | 切换成功后是否删除旧公网 IP 资源 |
+| `delete_old_ip` | `true` | 候选新 IP 检测正常后是否删除最初旧公网 IP；失败候选始终清理 |
 
 如需保留旧公网 IP，可将现有配置中的字段修改为：
 
@@ -189,7 +191,7 @@ sudo systemctl stop azure-ip-monitor
 "delete_old_ip": false
 ```
 
-常规检测一旦失败会立即进行下一次检测，不等待 `check_interval`；默认连续失败 `3` 次后更换公网 IP。公网 IP 更换后的恢复检测固定等待 `5` 秒，不受配置文件控制。新 IP 如果第一次连接 `gd-cu-v4.ip.zstaticcdn.com:80` 就超时，程序会立即继续创建并切换下一个 IP，直到 TCP 检测正常，然后恢复上表所示的常规检测间隔和失败阈值。旧配置中的 `ping_timeout` 会自动作为 `tcp_timeout` 读取，无需重新配置。
+常规检测一旦失败会立即进行下一次检测，不等待 `check_interval`；默认连续失败 `3` 次后开始更换公网 IP。脚本会保留最初的旧公网 IP，绑定候选新 IP 后等待 `5` 秒检测。候选失败时，由于 Azure 不允许删除仍绑定的公网 IP，脚本会先绑定下一个候选，使失败候选解绑后立即删除；候选检测正常后，才根据 `delete_old_ip` 删除或保留最初旧公网 IP，然后恢复常规监控。旧配置中的 `ping_timeout` 会自动作为 `tcp_timeout` 读取，无需重新配置。
 
 修改配置后重启服务：
 
