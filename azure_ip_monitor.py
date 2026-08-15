@@ -261,6 +261,7 @@ def configure_cloudflare(path: Path, config: Config) -> Config:
         raise MonitorError("配置 Cloudflare DDNS 需要交互终端")
 
     print("配置 Cloudflare DDNS，请输入密钥、用户名和需要解析的完整域名。")
+    print("CF密钥支持 API Token（推荐）或 Global API Key；API Token 需要 Zone:Read 和 DNS:Edit 权限。")
     if config.cf_key:
         print("CF密钥已配置，直接回车继续使用现有密钥。")
         entered_key = prompt_cloudflare_value("CF密钥", config.cf_key, secret=True)
@@ -452,12 +453,21 @@ class AzureClient:
 
 class CloudflareClient:
     def __init__(self, email: str, api_key: str) -> None:
-        self.headers = {
-            "X-Auth-Email": email,
-            "X-Auth-Key": api_key,
+        self.email = email.strip()
+        self.api_key = api_key.strip()
+        self.auth_mode = ""
+
+    def authentication_headers(self, auth_mode: str) -> dict[str, str]:
+        headers = {
             "Content-Type": "application/json",
             "User-Agent": "azure-ip-monitor/1.0",
         }
+        if auth_mode == "token":
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        else:
+            headers["X-Auth-Email"] = self.email
+            headers["X-Auth-Key"] = self.api_key
+        return headers
 
     def request(
         self,
@@ -470,28 +480,49 @@ class CloudflareClient:
         if query:
             url = f"{url}?{urllib.parse.urlencode(query)}"
         payload = json.dumps(body).encode() if body is not None else None
-        request = urllib.request.Request(url, data=payload, method=method, headers=self.headers)
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                raw = response.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            raise MonitorError(
-                f"Cloudflare API 请求失败（HTTP {error.code}）：{detail[:500]}"
-            ) from error
-        except urllib.error.URLError as error:
-            raise MonitorError(f"无法连接 Cloudflare API：{error.reason}") from error
+        auth_modes = [self.auth_mode] if self.auth_mode else ["token", "global"]
+        authentication_errors: list[str] = []
 
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as error:
-            raise MonitorError("Cloudflare API 返回了无效 JSON") from error
-        if not isinstance(parsed, dict):
-            raise MonitorError("Cloudflare API 返回格式异常")
-        if not parsed.get("success"):
-            raise MonitorError(f"Cloudflare API 返回失败：{parsed.get('errors')}")
-        return parsed
+        for auth_mode in auth_modes:
+            request = urllib.request.Request(
+                url,
+                data=payload,
+                method=method,
+                headers=self.authentication_headers(auth_mode),
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    raw = response.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")
+                if not self.auth_mode and error.code in {400, 401, 403}:
+                    authentication_errors.append(
+                        f"{auth_mode}: HTTP {error.code} {detail[:300]}"
+                    )
+                    continue
+                raise MonitorError(
+                    f"Cloudflare API 请求失败（HTTP {error.code}）：{detail[:500]}"
+                ) from error
+            except urllib.error.URLError as error:
+                raise MonitorError(f"无法连接 Cloudflare API：{error.reason}") from error
 
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise MonitorError("Cloudflare API 返回了无效 JSON") from error
+            if not isinstance(parsed, dict):
+                raise MonitorError("Cloudflare API 返回格式异常")
+            if not parsed.get("success"):
+                raise MonitorError(f"Cloudflare API 返回失败：{parsed.get('errors')}")
+            self.auth_mode = auth_mode
+            return parsed
+
+        detail = "; ".join(authentication_errors)
+        raise MonitorError(
+            "Cloudflare 认证失败：密钥无法作为 API Token 或 Global API Key 使用。"
+            "API Token 至少需要 Zone:Read 和 DNS:Edit 权限；Global API Key 需要填写账号邮箱。"
+            f" 详情：{detail}"
+        )
 
 def find_cloudflare_zone(client: CloudflareClient, domain_name: str) -> tuple[str, str]:
     domain = normalize_cloudflare_domain(domain_name)

@@ -131,8 +131,8 @@ CF密钥：
 域名：
 ```
 
-- `CF密钥`：Cloudflare 的 Global API Key，输入时不会回显。
-- `用户名`：Cloudflare 账号邮箱。
+- `CF密钥`：支持 Cloudflare API Token（推荐）或 Global API Key，输入时不会回显。API Token 至少需要 `Zone:Read` 和 `DNS:Edit` 权限。
+- `用户名`：Cloudflare 账号邮箱；使用 Global API Key 时必须正确填写，使用 API Token 时保留填写账号邮箱即可。
 - `域名`：直接填写需要解析的完整域名，例如 `example.com`、`www.example.com` 或 `node.hk.example.com`。
 
 脚本会根据填写的完整域名逐级查找账号中最长匹配的 Cloudflare Zone，无需手动区分根域名和记录名称。例如填写 `node.hk.example.com` 时，会依次尝试匹配 `node.hk.example.com`、`hk.example.com` 和 `example.com`，找到可用 Zone 后自动解析记录名称。
