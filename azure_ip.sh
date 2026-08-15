@@ -66,6 +66,10 @@ require_command() {
     fi
 }
 
+has_interactive_tty() {
+    [[ -r /dev/tty && -w /dev/tty ]] && ( : </dev/tty >/dev/tty ) 2>/dev/null
+}
+
 choose_existing_config_action() {
     local choice
 
@@ -123,7 +127,7 @@ fi
 require_command systemctl
 
 if [[ "${action}" == "install" && -f "${CONFIG_FILE}" ]]; then
-    if [[ -r /dev/tty ]]; then
+    if has_interactive_tty; then
         choose_existing_config_action
     else
         echo "检测到现有配置，非交互运行将保留配置并继续更新。"
@@ -191,7 +195,7 @@ download_file "${REPOSITORY_RAW_URL}/azure_ip_monitor.py" "${PYTHON_FILE}" 0755
 download_file "${REPOSITORY_RAW_URL}/azure_ip.sh" "${INSTALLER_FILE}" 0755
 
 if [[ "${action}" == "cf-ddns" ]]; then
-    if [[ ! -r /dev/tty ]]; then
+    if ! has_interactive_tty; then
         echo "错误：Cloudflare DDNS 配置需要交互终端。" >&2
         exit 1
     fi
@@ -209,7 +213,7 @@ if [[ "${action}" == "cf-ddns" ]]; then
     fi
     chmod 0600 "${CONFIG_FILE}"
 elif [[ "${action}" == "reconfigure" || ! -f "${CONFIG_FILE}" ]]; then
-    if [[ ! -r /dev/tty ]]; then
+    if ! has_interactive_tty; then
         echo "错误：首次配置需要交互终端，请先下载脚本后使用 sudo bash azure_ip.sh 运行。" >&2
         exit 1
     fi
