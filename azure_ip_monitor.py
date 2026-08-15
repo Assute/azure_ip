@@ -541,6 +541,9 @@ def nic_update_body(nic: dict[str, Any], selected_name: str, new_public_ip_id: s
     dns_servers = source.get("dnsSettings", {}).get("dnsServers")
     if isinstance(dns_servers, list):
         properties["dnsSettings"] = {"dnsServers": dns_servers}
+    network_security_group = id_reference(source.get("networkSecurityGroup"))
+    if network_security_group:
+        properties["networkSecurityGroup"] = network_security_group
 
     body: dict[str, Any] = {"location": nic.get("location"), "properties": properties}
     if isinstance(nic.get("tags"), dict):

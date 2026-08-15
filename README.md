@@ -25,6 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/Assute/azure_ip/main/azure_ip.sh | 
 - 自动发现订阅、资源组、虚拟机、主网卡和公网 IP
 - 自动识别 Azure 全球区和 Azure 中国区
 - 创建新 IP 时尽量保留原资源的 SKU、区域、可用区、标签和超时设置
+- 更新网卡公网 IP 时保留原有 NSG、DNS 和网卡功能设置，避免入站规则丢失
 - 最初旧 IP 保留到新 IP 的 TCP 检测正常后才删除，降低误删除风险
 - 候选检测失败后先回滚绑定最初旧 IP，再立即删除失败候选，脚本最多同时占用 2 个公网 IP
 - 支持保留旧公网 IP、单次检测和立即更换模式
