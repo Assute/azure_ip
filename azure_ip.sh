@@ -70,22 +70,22 @@ choose_existing_config_action() {
 
 检测到已有配置：${CONFIG_FILE}
 请选择操作：
-  1. 重新配置
-  2. 删除配置并停止后台服务
-  3. 保留配置，更新程序并重启服务（默认）
+  1. 更新脚本并重启服务（默认）
+  2. 重新配置
+  3. 删除配置并停止后台服务
 EOF
-        read -r -p "请输入选项 [1/2/3]：" choice </dev/tty || choice="3"
+        read -r -p "请输入选项 [1/2/3]：" choice </dev/tty || choice="1"
         case "${choice}" in
-            1)
-                action="reconfigure"
+            1|"")
+                action="install"
                 return
                 ;;
             2)
-                action="delete-config"
+                action="reconfigure"
                 return
                 ;;
-            3|"")
-                action="install"
+            3)
+                action="delete-config"
                 return
                 ;;
             *)

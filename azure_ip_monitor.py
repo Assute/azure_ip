@@ -59,7 +59,6 @@ class Config:
     tcp_timeout: int = 3
     check_interval: int = 10
     failure_threshold: int = 3
-    delete_old_ip: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
@@ -88,7 +87,6 @@ class Config:
             tcp_timeout=positive_int(data.get("tcp_timeout", data.get("ping_timeout", 3)), "tcp_timeout"),
             check_interval=positive_int(data.get("check_interval", 10), "check_interval"),
             failure_threshold=positive_int(data.get("failure_threshold", 3), "failure_threshold"),
-            delete_old_ip=bool(data.get("delete_old_ip", True)),
         )
 
 
@@ -185,7 +183,6 @@ def save_config(path: Path, config: Config) -> None:
         "tcp_timeout": config.tcp_timeout,
         "check_interval": config.check_interval,
         "failure_threshold": config.failure_threshold,
-        "delete_old_ip": config.delete_old_ip,
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -619,10 +616,11 @@ def rotate_public_ip(client: AzureClient, resources: AzureResources) -> AzureRes
     print(f"[{timestamp()}] 新地址为 {new_address}，正在更新网卡绑定", flush=True)
     bind_public_ip(client, resources, new_id)
     print(
-        f"[{timestamp()}] 新公网 IP 已绑定，旧公网 IP 暂时保留："
-        f"{resources.public_ip_address} -> {new_address}",
+        f"[{timestamp()}] 新公网 IP 已绑定：{resources.public_ip_address} -> {new_address}",
         flush=True,
     )
+    delete_public_ip(client, resources.public_ip_id, "已解绑的前一个公网 IP")
+    print(f"[{timestamp()}] 前一个公网 IP 已删除，仅保留当前新 IP", flush=True)
     return AzureResources(resources.nic_id, resources.ip_config_name, new_id, new_address)
 
 
@@ -648,48 +646,26 @@ def rotate_until_reachable(
     config: Config,
     resources: AzureResources,
 ) -> AzureResources:
-    preserved_resources = resources
     while True:
-        candidate_resources = rotate_public_ip(client, preserved_resources)
+        resources = rotate_public_ip(client, resources)
         print(
             f"[{timestamp()}] 等待 {POST_ROTATION_CHECK_DELAY} 秒后通过新公网 IP 检测 "
-            f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT}；如超时将回滚旧 IP",
+            f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT}；如超时将立即继续更换",
             flush=True,
         )
         time.sleep(POST_ROTATION_CHECK_DELAY)
         if tcp_check_once(config.tcp_timeout):
             print(
-                f"[{timestamp()}] 新公网 IP {candidate_resources.public_ip_address} 访问 "
-                f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT} 正常",
+                f"[{timestamp()}] 新公网 IP {resources.public_ip_address} 访问 "
+                f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT} 正常，恢复常规监控",
                 flush=True,
             )
-            if config.delete_old_ip:
-                delete_public_ip(
-                    client,
-                    preserved_resources.public_ip_id,
-                    "确认可用后保留至今的旧公网 IP",
-                )
-            else:
-                print(
-                    f"[{timestamp()}] 已按配置保留最初的旧公网 IP 资源："
-                    f"{preserved_resources.public_ip_id}",
-                    flush=True,
-                )
-            print(f"[{timestamp()}] 新公网 IP 已确认可用，恢复常规监控", flush=True)
-            return candidate_resources
-
+            return resources
         print(
-            f"[{timestamp()}] 新公网 IP {candidate_resources.public_ip_address} 访问 "
-            f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT} 超时，正在重新绑定最初旧 IP",
+            f"[{timestamp()}] 新公网 IP {resources.public_ip_address} 访问 "
+            f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT} 超时，立即继续更换",
             flush=True,
         )
-        bind_public_ip(client, candidate_resources, preserved_resources.public_ip_id)
-        print(
-            f"[{timestamp()}] 已恢复最初旧公网 IP：{preserved_resources.public_ip_address}",
-            flush=True,
-        )
-        delete_public_ip(client, candidate_resources.public_ip_id, "检测失败的候选公网 IP")
-        print(f"[{timestamp()}] 失败候选已删除，开始创建下一个候选公网 IP", flush=True)
 
 
 def monitor(client: AzureClient, config: Config, once: bool = False) -> int:
