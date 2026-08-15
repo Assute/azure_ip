@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import ipaddress
 import json
 import os
 import shutil
@@ -14,7 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ SUBSCRIPTIONS_API = "2022-12-01"
 POST_ROTATION_CHECK_DELAY = 5
 TCP_CHECK_HOST = "gd-cu-v4.ip.zstaticcdn.com"
 TCP_CHECK_PORT = 80
+CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
 
 CLOUDS = {
     "global": {
@@ -59,6 +61,10 @@ class Config:
     tcp_timeout: int = 3
     check_interval: int = 10
     failure_threshold: int = 3
+    cf_key: str = ""
+    cf_user: str = ""
+    cf_zone_name: str = ""
+    cf_record_name: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
@@ -76,6 +82,16 @@ class Config:
             raise MonitorError(f"配置缺少字段：{', '.join(missing)}")
         if data["cloud"] not in CLOUDS:
             raise MonitorError("cloud 必须是 global 或 china")
+        cloudflare_values = {
+            "CFKEY": str(data.get("CFKEY", "")).strip(),
+            "CFUSER": str(data.get("CFUSER", "")).strip(),
+            "CFZONE_NAME": str(data.get("CFZONE_NAME", "")).strip(),
+            "CFRECORD_NAME": str(data.get("CFRECORD_NAME", "")).strip(),
+        }
+        configured_values = [value for value in cloudflare_values.values() if value]
+        if configured_values and len(configured_values) != len(cloudflare_values):
+            missing_cloudflare = [key for key, value in cloudflare_values.items() if not value]
+            raise MonitorError(f"Cloudflare 配置缺少字段：{', '.join(missing_cloudflare)}")
         return cls(
             cloud=str(data["cloud"]),
             tenant_id=str(data["tenant_id"]),
@@ -87,7 +103,15 @@ class Config:
             tcp_timeout=positive_int(data.get("tcp_timeout", data.get("ping_timeout", 3)), "tcp_timeout"),
             check_interval=positive_int(data.get("check_interval", 10), "check_interval"),
             failure_threshold=positive_int(data.get("failure_threshold", 3), "failure_threshold"),
+            cf_key=cloudflare_values["CFKEY"],
+            cf_user=cloudflare_values["CFUSER"],
+            cf_zone_name=cloudflare_values["CFZONE_NAME"],
+            cf_record_name=cloudflare_values["CFRECORD_NAME"],
         )
+
+    @property
+    def cloudflare_enabled(self) -> bool:
+        return bool(self.cf_key and self.cf_user and self.cf_zone_name and self.cf_record_name)
 
 
 @dataclass(frozen=True)
@@ -157,6 +181,19 @@ def configure(path: Path) -> Config:
         resource_group=choice.resource_group,
         vm_name=choice.vm_name,
     )
+    if path.exists():
+        try:
+            previous = load_config(path)
+        except MonitorError:
+            pass
+        else:
+            config = replace(
+                config,
+                cf_key=previous.cf_key,
+                cf_user=previous.cf_user,
+                cf_zone_name=previous.cf_zone_name,
+                cf_record_name=previous.cf_record_name,
+            )
     save_config(path, config)
     print(
         f"已选择：{choice.vm_name} / {choice.resource_group} / "
@@ -168,6 +205,73 @@ def configure(path: Path) -> Config:
     )
     print(f"配置已保存到 {path}（权限 600）。")
     return config
+
+
+def normalize_cloudflare_record(zone_name: str, record_name: str) -> str:
+    zone = zone_name.strip().strip(".").lower()
+    record = record_name.strip().strip(".").lower()
+    if not zone or not record:
+        raise MonitorError("CFZONE_NAME 和 CFRECORD_NAME 不能为空")
+    if any(character.isspace() for character in zone + record):
+        raise MonitorError("Cloudflare 域名不能包含空格")
+    if record == "@":
+        return zone
+    if record == zone or record.endswith(f".{zone}"):
+        return record
+    return f"{record}.{zone}"
+
+
+def prompt_cloudflare_value(
+    label: str,
+    default: str | None = None,
+    secret: bool = False,
+) -> str:
+    suffix = f" [{default}]" if default and not secret else ""
+    while True:
+        prompt = f"{label}{suffix}="
+        value = getpass.getpass(prompt) if secret else input(prompt).strip()
+        if value:
+            return value
+        if default is not None:
+            return default
+        print("此项不能为空。")
+
+
+def configure_cloudflare(path: Path, config: Config) -> Config:
+    if not sys.stdin.isatty():
+        raise MonitorError("配置 Cloudflare DDNS 需要交互终端")
+
+    print("配置 Cloudflare DDNS；CFKEY 请填写 Global API Key。")
+    if config.cf_key:
+        print("CFKEY 已配置，直接回车继续使用现有密钥。")
+        entered_key = prompt_cloudflare_value("CFKEY", config.cf_key, secret=True)
+        cf_key = entered_key or config.cf_key
+    else:
+        cf_key = prompt_cloudflare_value("CFKEY", secret=True)
+    cf_user = prompt_cloudflare_value("CFUSER", config.cf_user or None)
+    cf_zone_name = prompt_cloudflare_value("CFZONE_NAME", config.cf_zone_name or None).strip().strip(".").lower()
+    cf_record_name = normalize_cloudflare_record(
+        cf_zone_name,
+        prompt_cloudflare_value("CFRECORD_NAME", config.cf_record_name or None),
+    )
+    updated = replace(
+        config,
+        cf_key=cf_key,
+        cf_user=cf_user,
+        cf_zone_name=cf_zone_name,
+        cf_record_name=cf_record_name,
+    )
+
+    azure_client = AzureClient(updated)
+    resources = discover_resources(azure_client, updated)
+    action = sync_cloudflare_dns(updated, resources.public_ip_address)
+    save_config(path, updated)
+    print(
+        f"Cloudflare DDNS 配置成功：{cf_record_name} {action}为 "
+        f"{resources.public_ip_address}"
+    )
+    print(f"配置已保存到 {path}（权限 600）。")
+    return updated
 
 
 def save_config(path: Path, config: Config) -> None:
@@ -184,6 +288,15 @@ def save_config(path: Path, config: Config) -> None:
         "check_interval": config.check_interval,
         "failure_threshold": config.failure_threshold,
     }
+    if config.cloudflare_enabled:
+        data.update(
+            {
+                "CFKEY": config.cf_key,
+                "CFUSER": config.cf_user,
+                "CFZONE_NAME": config.cf_zone_name,
+                "CFRECORD_NAME": config.cf_record_name,
+            }
+        )
     temporary = path.with_suffix(path.suffix + ".tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -315,6 +428,137 @@ class AzureClient:
                 raise MonitorError(f"资源部署失败，状态：{state}")
             time.sleep(3)
         raise MonitorError(f"等待 Azure 资源部署超时（{timeout} 秒）")
+
+
+class CloudflareClient:
+    def __init__(self, email: str, api_key: str) -> None:
+        self.headers = {
+            "X-Auth-Email": email,
+            "X-Auth-Key": api_key,
+            "Content-Type": "application/json",
+            "User-Agent": "azure-ip-monitor/1.0",
+        }
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        query: dict[str, str] | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        url = f"{CLOUDFLARE_API}{path}"
+        if query:
+            url = f"{url}?{urllib.parse.urlencode(query)}"
+        payload = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=payload, method=method, headers=self.headers)
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise MonitorError(
+                f"Cloudflare API 请求失败（HTTP {error.code}）：{detail[:500]}"
+            ) from error
+        except urllib.error.URLError as error:
+            raise MonitorError(f"无法连接 Cloudflare API：{error.reason}") from error
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise MonitorError("Cloudflare API 返回了无效 JSON") from error
+        if not isinstance(parsed, dict):
+            raise MonitorError("Cloudflare API 返回格式异常")
+        if not parsed.get("success"):
+            raise MonitorError(f"Cloudflare API 返回失败：{parsed.get('errors')}")
+        return parsed
+
+
+def sync_cloudflare_dns(config: Config, public_ip_address: str) -> str:
+    if not config.cloudflare_enabled:
+        return "未启用"
+    try:
+        ipaddress.IPv4Address(public_ip_address)
+    except ipaddress.AddressValueError as error:
+        raise MonitorError(f"Cloudflare DDNS 仅支持 IPv4 地址：{public_ip_address}") from error
+
+    record_name = normalize_cloudflare_record(config.cf_zone_name, config.cf_record_name)
+    client = CloudflareClient(config.cf_user, config.cf_key)
+    zones = client.request(
+        "GET",
+        "/zones",
+        {"name": config.cf_zone_name, "status": "active", "per_page": "50"},
+    ).get("result", [])
+    if not isinstance(zones, list):
+        raise MonitorError("Cloudflare Zone 查询返回格式异常")
+    zone = next(
+        (
+            item
+            for item in zones
+            if isinstance(item, dict)
+            and str(item.get("name", "")).lower() == config.cf_zone_name.lower()
+        ),
+        None,
+    )
+    if not zone or not isinstance(zone.get("id"), str):
+        raise MonitorError(f"Cloudflare 中未找到可用 Zone：{config.cf_zone_name}")
+    zone_id = zone["id"]
+
+    records = client.request(
+        "GET",
+        f"/zones/{zone_id}/dns_records",
+        {"type": "A", "name": record_name, "per_page": "100"},
+    ).get("result", [])
+    if not isinstance(records, list):
+        raise MonitorError("Cloudflare DNS 记录查询返回格式异常")
+    record = next(
+        (
+            item
+            for item in records
+            if isinstance(item, dict)
+            and str(item.get("name", "")).lower() == record_name
+            and item.get("type") == "A"
+        ),
+        None,
+    )
+    if record and isinstance(record.get("id"), str):
+        client.request(
+            "PATCH",
+            f"/zones/{zone_id}/dns_records/{record['id']}",
+            body={"content": public_ip_address},
+        )
+        return "已更新"
+
+    client.request(
+        "POST",
+        f"/zones/{zone_id}/dns_records",
+        body={
+            "type": "A",
+            "name": record_name,
+            "content": public_ip_address,
+            "ttl": 1,
+            "proxied": False,
+        },
+    )
+    return "已创建"
+
+
+def try_sync_cloudflare_dns(config: Config, public_ip_address: str) -> bool:
+    if not config.cloudflare_enabled:
+        return False
+    try:
+        action = sync_cloudflare_dns(config, public_ip_address)
+        print(
+            f"[{timestamp()}] Cloudflare A 记录 {config.cf_record_name} "
+            f"{action}为 {public_ip_address}",
+            flush=True,
+        )
+        return True
+    except MonitorError as error:
+        print(
+            f"[{timestamp()}] Cloudflare DDNS 同步失败，将稍后重试：{error}",
+            flush=True,
+        )
+        return False
 
 
 def first_with_primary(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -670,6 +914,9 @@ def rotate_until_reachable(
 
 def monitor(client: AzureClient, config: Config, once: bool = False) -> int:
     resources = discover_resources(client, config)
+    cloudflare_synced_ip = ""
+    if try_sync_cloudflare_dns(config, resources.public_ip_address):
+        cloudflare_synced_ip = resources.public_ip_address
     print(
         f"[{timestamp()}] 开始监控 {config.vm_name}，当前公网 IP：{resources.public_ip_address}；"
         f"检测目标 TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT}，"
@@ -686,6 +933,9 @@ def monitor(client: AzureClient, config: Config, once: bool = False) -> int:
                 f"（当前公网 IP：{resources.public_ip_address}）",
                 flush=True,
             )
+            if config.cloudflare_enabled and cloudflare_synced_ip != resources.public_ip_address:
+                if try_sync_cloudflare_dns(config, resources.public_ip_address):
+                    cloudflare_synced_ip = resources.public_ip_address
         else:
             failures += 1
             print(
@@ -700,6 +950,9 @@ def monitor(client: AzureClient, config: Config, once: bool = False) -> int:
         if failures >= config.failure_threshold:
             resources = discover_resources(client, config)
             resources = rotate_until_reachable(client, config, resources)
+            cloudflare_synced_ip = ""
+            if try_sync_cloudflare_dns(config, resources.public_ip_address):
+                cloudflare_synced_ip = resources.public_ip_address
             failures = 0
             time.sleep(config.check_interval)
             continue
@@ -715,6 +968,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="配置文件路径")
     parser.add_argument("--configure", action="store_true", help="重新填写并保存配置")
     parser.add_argument("--configure-only", action="store_true", help="完成配置后退出，不启动监控")
+    parser.add_argument("--configure-cloudflare", action="store_true", help="配置 Cloudflare DDNS 后退出")
     parser.add_argument("--once", action="store_true", help="只检测一次，不更换 IP")
     parser.add_argument("--rotate-now", action="store_true", help="立即更换公网 IP")
     return parser.parse_args()
@@ -728,6 +982,11 @@ def main() -> int:
         return 2
 
     try:
+        if args.configure_cloudflare:
+            if not args.config.exists():
+                raise MonitorError("请先完成 Azure 配置，再配置 Cloudflare DDNS")
+            configure_cloudflare(args.config, load_config(args.config))
+            return 0
         should_configure = args.configure or args.configure_only or not args.config.exists()
         config = configure(args.config) if should_configure else load_config(args.config)
         if args.configure_only:
@@ -736,7 +995,8 @@ def main() -> int:
         if args.rotate_now:
             resources = discover_resources(client, config)
             print(f"当前公网 IP：{resources.public_ip_address}")
-            rotate_until_reachable(client, config, resources)
+            resources = rotate_until_reachable(client, config, resources)
+            try_sync_cloudflare_dns(config, resources.public_ip_address)
             return 0
         return monitor(client, config, once=args.once)
     except KeyboardInterrupt:

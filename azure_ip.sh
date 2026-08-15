@@ -20,6 +20,7 @@ Azure 公网 IP 监控器一键安装脚本
   sudo bash azure_ip.sh                 安装或更新，并启动后台服务
   sudo bash azure_ip.sh --reconfigure   重新填写 Azure 配置并重启服务
   sudo bash azure_ip.sh --delete-config 删除配置并停止后台服务
+  sudo bash azure_ip.sh --cf-ddns       配置 Cloudflare DDNS 并重启服务
   bash azure_ip.sh --status             查看服务状态
   bash azure_ip.sh --logs               持续查看服务日志
   bash azure_ip.sh --help               显示帮助
@@ -36,6 +37,9 @@ for argument in "$@"; do
             ;;
         --delete-config)
             action="delete-config"
+            ;;
+        --cf-ddns)
+            action="cf-ddns"
             ;;
         --status)
             action="status"
@@ -73,8 +77,9 @@ choose_existing_config_action() {
   1. 更新脚本并重启服务（默认）
   2. 重新配置
   3. 删除配置并停止后台服务
+  4. Cloudflare DDNS配置
 EOF
-        read -r -p "请输入选项 [1/2/3]：" choice </dev/tty || choice="1"
+        read -r -p "请输入选项 [1/2/3/4]：" choice </dev/tty || choice="1"
         case "${choice}" in
             1|"")
                 action="install"
@@ -88,8 +93,12 @@ EOF
                 action="delete-config"
                 return
                 ;;
+            4)
+                action="cf-ddns"
+                return
+                ;;
             *)
-                echo "无效选项，请输入 1、2 或 3。" >/dev/tty
+                echo "无效选项，请输入 1、2、3 或 4。" >/dev/tty
                 ;;
         esac
     done
@@ -135,6 +144,11 @@ if [[ "${action}" == "delete-config" ]]; then
     exit 0
 fi
 
+if [[ "${action}" == "cf-ddns" && ! -f "${CONFIG_FILE}" ]]; then
+    echo "错误：请先完成 Azure 配置，再配置 Cloudflare DDNS。" >&2
+    exit 1
+fi
+
 require_command python3
 require_command bash
 require_command timeout
@@ -176,7 +190,25 @@ echo "正在下载最新版程序到 ${INSTALL_DIR} ..."
 download_file "${REPOSITORY_RAW_URL}/azure_ip_monitor.py" "${PYTHON_FILE}" 0755
 download_file "${REPOSITORY_RAW_URL}/azure_ip.sh" "${INSTALLER_FILE}" 0755
 
-if [[ "${action}" == "reconfigure" || ! -f "${CONFIG_FILE}" ]]; then
+if [[ "${action}" == "cf-ddns" ]]; then
+    if [[ ! -r /dev/tty ]]; then
+        echo "错误：Cloudflare DDNS 配置需要交互终端。" >&2
+        exit 1
+    fi
+    service_was_active="false"
+    if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+        service_was_active="true"
+        systemctl stop "${SERVICE_NAME}.service"
+    fi
+    echo "开始配置 Cloudflare DDNS ..."
+    if ! python3 "${PYTHON_FILE}" --config "${CONFIG_FILE}" --configure-cloudflare </dev/tty; then
+        if [[ "${service_was_active}" == "true" ]]; then
+            systemctl start "${SERVICE_NAME}.service" || true
+        fi
+        exit 1
+    fi
+    chmod 0600 "${CONFIG_FILE}"
+elif [[ "${action}" == "reconfigure" || ! -f "${CONFIG_FILE}" ]]; then
     if [[ ! -r /dev/tty ]]; then
         echo "错误：首次配置需要交互终端，请先下载脚本后使用 sudo bash azure_ip.sh 运行。" >&2
         exit 1
