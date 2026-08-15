@@ -283,13 +283,10 @@ def configure_cloudflare(path: Path, config: Config) -> Config:
         cf_record_name=cf_record_name,
     )
 
-    azure_client = AzureClient(updated)
-    resources = discover_resources(azure_client, updated)
-    action = sync_cloudflare_dns(updated, resources.public_ip_address)
     save_config(path, updated)
     print(
-        f"Cloudflare DDNS 配置成功：{cf_record_name} {action}为 "
-        f"{resources.public_ip_address}"
+        f"Cloudflare DDNS 配置成功：{cf_record_name} 将在后台服务检测到 "
+        "当前公网 IP 正常后自动创建或更新解析"
     )
     print(f"配置已保存到 {path}（权限 600）。")
     return updated
@@ -1131,8 +1128,6 @@ def monitor(client: AzureClient, config: Config, once: bool = False) -> int:
     if not once:
         cleanup_managed_public_ips(client, resources)
     cloudflare_synced_ip = ""
-    if try_sync_cloudflare_dns(config, resources.public_ip_address):
-        cloudflare_synced_ip = resources.public_ip_address
     print(
         f"[{timestamp()}] 开始监控 {config.vm_name}，当前公网 IP：{resources.public_ip_address}；"
         f"检测目标 TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT}，"

@@ -118,7 +118,7 @@ sudo bash azure_ip.sh
 4. Cloudflare DDNS配置
 ```
 
-选择 `1` 会保留现有配置、下载最新版脚本并重启服务；选择 `2` 会重新填写 Azure 凭据和目标虚拟机；选择 `3` 会先停止并禁用 `azure-ip-monitor.service`，然后安全删除配置文件；选择 `4` 会配置 Cloudflare DDNS，并立即把当前 Azure 公网 IP 同步到指定 A 记录。
+选择 `1` 会保留现有配置、下载最新版脚本并重启服务；选择 `2` 会重新填写 Azure 凭据和目标虚拟机；选择 `3` 会先停止并禁用 `azure-ip-monitor.service`，然后安全删除配置文件；选择 `4` 会配置 Cloudflare DDNS 并重启服务，服务启动后仅在当前公网 IP 通过 TCP 检测时同步指定 A 记录。
 
 
 ## Cloudflare DDNS
@@ -137,7 +137,7 @@ CF密钥：
 
 脚本会根据填写的完整域名逐级查找账号中最长匹配的 Cloudflare Zone，无需手动区分根域名和记录名称。例如填写 `node.hk.example.com` 时，会依次尝试匹配 `node.hk.example.com`、`hk.example.com` 和 `example.com`，找到可用 Zone 后自动解析记录名称。
 
-配置时会验证 Cloudflare 凭据和自动识别的 Zone，并把当前 Azure 公网 IP 写入 A 记录；记录不存在时自动创建，存在时只更新地址。后续 Azure 公网 IP 更换并通过 TCP 检测后，会自动同步 Cloudflare。同步失败不会触发再次换 IP，后台服务会在后续正常检测时继续重试。
+配置时只验证 Cloudflare 凭据、自动识别 Zone 并保存配置，不会立即修改 DNS。后台服务启动后会先检测当前公网 IP，检测正常才创建或更新 A 记录；启动检测失败时不会更新，连续失败触发换 IP 后，也只在新 IP 通过 TCP 检测时同步 Cloudflare。同步失败不会触发再次换 IP，后台服务会在后续正常检测时继续重试。
 
 ## 管理命令
 
