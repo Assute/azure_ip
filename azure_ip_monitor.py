@@ -25,7 +25,7 @@ DEFAULT_CONFIG = SCRIPT_DIR / "azure_ip_monitor.json"
 COMPUTE_API = "2024-11-01"
 NETWORK_API = "2024-05-01"
 SUBSCRIPTIONS_API = "2022-12-01"
-POST_ROTATION_CHECK_DELAY = 2
+POST_ROTATION_CHECK_DELAY = 5
 TCP_CHECK_HOST = "gd-cu-v4.ip.zstaticcdn.com"
 TCP_CHECK_PORT = 80
 
@@ -166,7 +166,7 @@ def configure(path: Path) -> Config:
     )
     print(
         f"监控参数：每 10 秒检测 TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT}，单次超时 3 秒，"
-        "连续失败 3 次后更换 IP；换 IP 后每 2 秒验证，失败一次立即继续更换。"
+        "连续失败 3 次后更换 IP；换 IP 后等待 5 秒验证，失败一次立即继续更换。"
     )
     print(f"配置已保存到 {path}（权限 600）。")
     return config
