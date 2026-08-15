@@ -590,9 +590,20 @@ def replacement_id(old_id: str) -> str:
     return f"{old_id.rsplit('/', 1)[0]}/{new_name}"
 
 
+def bind_public_ip(client: AzureClient, resources: AzureResources, public_ip_id: str) -> None:
+    nic = client.request("GET", resources.nic_id, NETWORK_API)
+    body = nic_update_body(nic, resources.ip_config_name, public_ip_id)
+    client.request("PUT", resources.nic_id, NETWORK_API, body)
+    updated_nic = client.wait_for_resource(resources.nic_id, NETWORK_API)
+    configurations = updated_nic.get("properties", {}).get("ipConfigurations", [])
+    selected = next((item for item in configurations if item.get("name") == resources.ip_config_name), None)
+    attached_id = (selected or {}).get("properties", {}).get("publicIPAddress", {}).get("id", "")
+    if attached_id.lower() != public_ip_id.lower():
+        raise MonitorError("网卡更新完成，但未验证到目标公网 IP 绑定")
+
+
 def rotate_public_ip(client: AzureClient, resources: AzureResources) -> AzureResources:
     old_public_ip = client.request("GET", resources.public_ip_id, NETWORK_API)
-    nic = client.request("GET", resources.nic_id, NETWORK_API)
     new_id = replacement_id(resources.public_ip_id)
     new_name = new_id.rsplit("/", 1)[-1]
     print(f"[{timestamp()}] 正在创建新公网 IP 资源：{new_name}", flush=True)
@@ -603,15 +614,7 @@ def rotate_public_ip(client: AzureClient, resources: AzureResources) -> AzureRes
         raise MonitorError("新公网 IP 创建成功，但没有获得 IP 地址")
 
     print(f"[{timestamp()}] 新地址为 {new_address}，正在更新网卡绑定", flush=True)
-    body = nic_update_body(nic, resources.ip_config_name, new_id)
-    client.request("PUT", resources.nic_id, NETWORK_API, body)
-    updated_nic = client.wait_for_resource(resources.nic_id, NETWORK_API)
-    configurations = updated_nic.get("properties", {}).get("ipConfigurations", [])
-    selected = next((item for item in configurations if item.get("name") == resources.ip_config_name), None)
-    attached_id = (selected or {}).get("properties", {}).get("publicIPAddress", {}).get("id", "")
-    if attached_id.lower() != new_id.lower():
-        raise MonitorError("网卡更新完成，但未验证到新公网 IP 绑定；旧 IP 未删除")
-
+    bind_public_ip(client, resources, new_id)
     print(
         f"[{timestamp()}] 新公网 IP 已绑定，旧公网 IP 暂时保留："
         f"{resources.public_ip_address} -> {new_address}",
@@ -642,42 +645,48 @@ def rotate_until_reachable(
     config: Config,
     resources: AzureResources,
 ) -> AzureResources:
-    preserved_public_ip_id = resources.public_ip_id
+    preserved_resources = resources
     while True:
-        previous_resources = resources
-        resources = rotate_public_ip(client, previous_resources)
-
-        if previous_resources.public_ip_id.lower() != preserved_public_ip_id.lower():
-            delete_public_ip(client, previous_resources.public_ip_id, "检测失败的公网 IP")
-
+        candidate_resources = rotate_public_ip(client, preserved_resources)
         print(
             f"[{timestamp()}] 等待 {POST_ROTATION_CHECK_DELAY} 秒后通过新公网 IP 检测 "
-            f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT}；如超时将立即继续更换",
+            f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT}；如超时将回滚旧 IP",
             flush=True,
         )
         time.sleep(POST_ROTATION_CHECK_DELAY)
         if tcp_check_once(config.tcp_timeout):
             print(
-                f"[{timestamp()}] 新公网 IP {resources.public_ip_address} 访问 "
+                f"[{timestamp()}] 新公网 IP {candidate_resources.public_ip_address} 访问 "
                 f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT} 正常",
                 flush=True,
             )
             if config.delete_old_ip:
-                delete_public_ip(client, preserved_public_ip_id, "确认可用后保留至今的旧公网 IP")
+                delete_public_ip(
+                    client,
+                    preserved_resources.public_ip_id,
+                    "确认可用后保留至今的旧公网 IP",
+                )
             else:
                 print(
-                    f"[{timestamp()}] 已按配置保留最初的旧公网 IP 资源：{preserved_public_ip_id}",
+                    f"[{timestamp()}] 已按配置保留最初的旧公网 IP 资源："
+                    f"{preserved_resources.public_ip_id}",
                     flush=True,
                 )
             print(f"[{timestamp()}] 新公网 IP 已确认可用，恢复常规监控", flush=True)
-            return resources
+            return candidate_resources
+
         print(
-            f"[{timestamp()}] 新公网 IP {resources.public_ip_address} 访问 "
-            f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT} 超时；"
-            "绑定下一个候选 IP 后将立即删除该失败 IP",
+            f"[{timestamp()}] 新公网 IP {candidate_resources.public_ip_address} 访问 "
+            f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT} 超时，正在重新绑定最初旧 IP",
             flush=True,
         )
-        resources = discover_resources(client, config)
+        bind_public_ip(client, candidate_resources, preserved_resources.public_ip_id)
+        print(
+            f"[{timestamp()}] 已恢复最初旧公网 IP：{preserved_resources.public_ip_address}",
+            flush=True,
+        )
+        delete_public_ip(client, candidate_resources.public_ip_id, "检测失败的候选公网 IP")
+        print(f"[{timestamp()}] 失败候选已删除，开始创建下一个候选公网 IP", flush=True)
 
 
 def monitor(client: AzureClient, config: Config, once: bool = False) -> int:
