@@ -8,6 +8,7 @@ import getpass
 import ipaddress
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,10 @@ COMPUTE_API = "2024-11-01"
 NETWORK_API = "2024-05-01"
 SUBSCRIPTIONS_API = "2022-12-01"
 POST_ROTATION_CHECK_DELAY = 5
+PUBLIC_IP_DELETE_RETRIES = 5
+PUBLIC_IP_DELETE_WAIT = 90
+MANAGED_PUBLIC_IP_TAG = "azure-ip-monitor-nic"
+ROTATION_SUFFIX_PATTERN = re.compile(r"-r\d{14}")
 TCP_CHECK_HOST = "gd-cu-v4.ip.zstaticcdn.com"
 TCP_CHECK_PORT = 80
 CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
@@ -207,18 +212,32 @@ def configure(path: Path) -> Config:
     return config
 
 
+def normalize_cloudflare_domain(domain_name: str) -> str:
+    domain = domain_name.strip().strip(".").lower()
+    if not domain:
+        raise MonitorError("域名不能为空")
+    if any(character.isspace() for character in domain):
+        raise MonitorError("域名不能包含空格")
+    try:
+        domain = domain.encode("idna").decode("ascii")
+    except UnicodeError as error:
+        raise MonitorError(f"域名格式无效：{domain_name}") from error
+    labels = domain.split(".")
+    if len(labels) < 2 or any(not label for label in labels):
+        raise MonitorError("请输入完整的二级或三级域名，例如 example.com 或 www.example.com")
+    return domain
+
+
 def normalize_cloudflare_record(zone_name: str, record_name: str) -> str:
-    zone = zone_name.strip().strip(".").lower()
+    zone = normalize_cloudflare_domain(zone_name)
     record = record_name.strip().strip(".").lower()
-    if not zone or not record:
-        raise MonitorError("CFZONE_NAME 和 CFRECORD_NAME 不能为空")
-    if any(character.isspace() for character in zone + record):
-        raise MonitorError("Cloudflare 域名不能包含空格")
+    if not record:
+        raise MonitorError("Cloudflare 记录名称不能为空")
     if record == "@":
         return zone
     if record == zone or record.endswith(f".{zone}"):
-        return record
-    return f"{record}.{zone}"
+        return normalize_cloudflare_domain(record)
+    return normalize_cloudflare_domain(f"{record}.{zone}")
 
 
 def prompt_cloudflare_value(
@@ -228,7 +247,7 @@ def prompt_cloudflare_value(
 ) -> str:
     suffix = f" [{default}]" if default and not secret else ""
     while True:
-        prompt = f"{label}{suffix}="
+        prompt = f"{label}{suffix}："
         value = getpass.getpass(prompt) if secret else input(prompt).strip()
         if value:
             return value
@@ -241,19 +260,20 @@ def configure_cloudflare(path: Path, config: Config) -> Config:
     if not sys.stdin.isatty():
         raise MonitorError("配置 Cloudflare DDNS 需要交互终端")
 
-    print("配置 Cloudflare DDNS；CFKEY 请填写 Global API Key。")
+    print("配置 Cloudflare DDNS，请输入密钥、用户名和需要解析的完整域名。")
     if config.cf_key:
-        print("CFKEY 已配置，直接回车继续使用现有密钥。")
-        entered_key = prompt_cloudflare_value("CFKEY", config.cf_key, secret=True)
+        print("CF密钥已配置，直接回车继续使用现有密钥。")
+        entered_key = prompt_cloudflare_value("CF密钥", config.cf_key, secret=True)
         cf_key = entered_key or config.cf_key
     else:
-        cf_key = prompt_cloudflare_value("CFKEY", secret=True)
-    cf_user = prompt_cloudflare_value("CFUSER", config.cf_user or None)
-    cf_zone_name = prompt_cloudflare_value("CFZONE_NAME", config.cf_zone_name or None).strip().strip(".").lower()
-    cf_record_name = normalize_cloudflare_record(
-        cf_zone_name,
-        prompt_cloudflare_value("CFRECORD_NAME", config.cf_record_name or None),
+        cf_key = prompt_cloudflare_value("CF密钥", secret=True)
+    cf_user = prompt_cloudflare_value("用户名", config.cf_user or None)
+    cf_record_name = normalize_cloudflare_domain(
+        prompt_cloudflare_value("域名", config.cf_record_name or None)
     )
+    cloudflare_client = CloudflareClient(cf_user, cf_key)
+    _, cf_zone_name = find_cloudflare_zone(cloudflare_client, cf_record_name)
+    print(f"已自动识别 Cloudflare Zone：{cf_zone_name}")
     updated = replace(
         config,
         cf_key=cf_key,
@@ -473,6 +493,37 @@ class CloudflareClient:
         return parsed
 
 
+def find_cloudflare_zone(client: CloudflareClient, domain_name: str) -> tuple[str, str]:
+    domain = normalize_cloudflare_domain(domain_name)
+    labels = domain.split(".")
+    attempted: list[str] = []
+    for index in range(len(labels) - 1):
+        candidate = ".".join(labels[index:])
+        attempted.append(candidate)
+        zones = client.request(
+            "GET",
+            "/zones",
+            {"name": candidate, "status": "active", "per_page": "50"},
+        ).get("result", [])
+        if not isinstance(zones, list):
+            raise MonitorError("Cloudflare Zone 查询返回格式异常")
+        zone = next(
+            (
+                item
+                for item in zones
+                if isinstance(item, dict)
+                and str(item.get("name", "")).lower() == candidate
+                and isinstance(item.get("id"), str)
+            ),
+            None,
+        )
+        if zone:
+            return zone["id"], candidate
+    raise MonitorError(
+        f"Cloudflare 中未找到域名 {domain} 对应的可用 Zone；已尝试：{', '.join(attempted)}"
+    )
+
+
 def sync_cloudflare_dns(config: Config, public_ip_address: str) -> str:
     if not config.cloudflare_enabled:
         return "未启用"
@@ -483,25 +534,7 @@ def sync_cloudflare_dns(config: Config, public_ip_address: str) -> str:
 
     record_name = normalize_cloudflare_record(config.cf_zone_name, config.cf_record_name)
     client = CloudflareClient(config.cf_user, config.cf_key)
-    zones = client.request(
-        "GET",
-        "/zones",
-        {"name": config.cf_zone_name, "status": "active", "per_page": "50"},
-    ).get("result", [])
-    if not isinstance(zones, list):
-        raise MonitorError("Cloudflare Zone 查询返回格式异常")
-    zone = next(
-        (
-            item
-            for item in zones
-            if isinstance(item, dict)
-            and str(item.get("name", "")).lower() == config.cf_zone_name.lower()
-        ),
-        None,
-    )
-    if not zone or not isinstance(zone.get("id"), str):
-        raise MonitorError(f"Cloudflare 中未找到可用 Zone：{config.cf_zone_name}")
-    zone_id = zone["id"]
+    zone_id, _ = find_cloudflare_zone(client, record_name)
 
     records = client.request(
         "GET",
@@ -792,7 +825,7 @@ def nic_update_body(nic: dict[str, Any], selected_name: str, new_public_ip_id: s
     return body
 
 
-def new_public_ip_body(old: dict[str, Any]) -> dict[str, Any]:
+def new_public_ip_body(old: dict[str, Any], nic_name: str) -> dict[str, Any]:
     old_properties = old.get("properties", {})
     properties: dict[str, Any] = {
         "publicIPAllocationMethod": "Static",
@@ -820,8 +853,9 @@ def new_public_ip_body(old: dict[str, Any]) -> dict[str, Any]:
     }
     if isinstance(old.get("zones"), list) and old["zones"]:
         body["zones"] = old["zones"]
-    if isinstance(old.get("tags"), dict):
-        body["tags"] = old["tags"]
+    tags = dict(old.get("tags", {})) if isinstance(old.get("tags"), dict) else {}
+    tags[MANAGED_PUBLIC_IP_TAG] = nic_name
+    body["tags"] = tags
     if isinstance(old.get("extendedLocation"), dict):
         body["extendedLocation"] = old["extendedLocation"]
     return body
@@ -846,19 +880,173 @@ def bind_public_ip(client: AzureClient, resources: AzureResources, public_ip_id:
         raise MonitorError("网卡更新完成，但未验证到目标公网 IP 绑定")
 
 
+def optional_public_ip(client: AzureClient, public_ip_id: str) -> dict[str, Any] | None:
+    try:
+        return client.request("GET", public_ip_id, NETWORK_API)
+    except MonitorError as error:
+        if "HTTP 404" in str(error):
+            return None
+        raise
+
+
+def public_ip_association(public_ip: dict[str, Any]) -> str:
+    properties = public_ip.get("properties", {})
+    for key in (
+        "ipConfiguration",
+        "natGateway",
+        "linkedPublicIPAddress",
+        "servicePublicIPAddress",
+    ):
+        reference = properties.get(key)
+        if isinstance(reference, dict) and isinstance(reference.get("id"), str):
+            return reference["id"]
+    return ""
+
+
+def delete_public_ip(client: AzureClient, public_ip_id: str, description: str) -> None:
+    print(f"[{timestamp()}] 正在删除{description}：{public_ip_id}", flush=True)
+    detach_deadline = time.monotonic() + PUBLIC_IP_DELETE_WAIT
+    while True:
+        public_ip = optional_public_ip(client, public_ip_id)
+        if public_ip is None:
+            print(f"[{timestamp()}] 目标公网 IP 已不存在，无需重复删除", flush=True)
+            return
+        association = public_ip_association(public_ip)
+        if not association:
+            break
+        if time.monotonic() >= detach_deadline:
+            raise MonitorError(f"公网 IP 仍绑定到资源，无法删除：{association}")
+        print(f"[{timestamp()}] 公网 IP 尚未完成解绑，等待 3 秒：{association}", flush=True)
+        time.sleep(3)
+
+    last_error: MonitorError | None = None
+    for attempt in range(1, PUBLIC_IP_DELETE_RETRIES + 1):
+        try:
+            client.request("DELETE", public_ip_id, NETWORK_API)
+        except MonitorError as error:
+            last_error = error
+            print(
+                f"[{timestamp()}] 删除公网 IP 请求失败 "
+                f"({attempt}/{PUBLIC_IP_DELETE_RETRIES})：{error}",
+                flush=True,
+            )
+            if attempt < PUBLIC_IP_DELETE_RETRIES:
+                time.sleep(3)
+            continue
+
+        if optional_public_ip(client, public_ip_id) is None:
+            print(f"[{timestamp()}] 公网 IP 已确认删除", flush=True)
+            return
+        delete_deadline = time.monotonic() + PUBLIC_IP_DELETE_WAIT
+        while time.monotonic() < delete_deadline:
+            time.sleep(3)
+            if optional_public_ip(client, public_ip_id) is None:
+                print(f"[{timestamp()}] 公网 IP 已确认删除", flush=True)
+                return
+        print(
+            f"[{timestamp()}] 等待公网 IP 删除超时 "
+            f"({attempt}/{PUBLIC_IP_DELETE_RETRIES})，准备重试",
+            flush=True,
+        )
+    detail = f"：{last_error}" if last_error else ""
+    raise MonitorError(f"多次重试后仍无法删除公网 IP {public_ip_id}{detail}")
+
+
+def cleanup_unattached_public_ip(client: AzureClient, public_ip_id: str, description: str) -> None:
+    try:
+        public_ip = optional_public_ip(client, public_ip_id)
+        if public_ip is None:
+            return
+        association = public_ip_association(public_ip)
+        if association:
+            print(
+                f"[{timestamp()}] {description}当前已绑定到 {association}，跳过删除",
+                flush=True,
+            )
+            return
+        delete_public_ip(client, public_ip_id, description)
+    except MonitorError as error:
+        print(f"[{timestamp()}] 清理{description}失败：{error}", flush=True)
+
+
+def rotation_family_name(public_ip_name: str) -> str:
+    match = ROTATION_SUFFIX_PATTERN.search(public_ip_name)
+    return public_ip_name[: match.start()] if match else public_ip_name
+
+
+def belongs_to_rotation_family(candidate_name: str, current_name: str) -> bool:
+    family_name = rotation_family_name(current_name)
+    if candidate_name == family_name:
+        return True
+    return candidate_name.startswith(f"{family_name}-r") and bool(
+        ROTATION_SUFFIX_PATTERN.search(candidate_name)
+    )
+
+
+def cleanup_managed_public_ips(client: AzureClient, resources: AzureResources) -> None:
+    collection_id = resources.public_ip_id.rsplit("/", 1)[0]
+    current_name = resources.public_ip_id.rstrip("/").rsplit("/", 1)[-1]
+    nic_name = resources.nic_id.rstrip("/").rsplit("/", 1)[-1]
+    for public_ip in client.list_resources(collection_id, NETWORK_API):
+        public_ip_id = public_ip.get("id")
+        if not isinstance(public_ip_id, str):
+            continue
+        if public_ip_id.lower() == resources.public_ip_id.lower():
+            continue
+        candidate_name = str(public_ip.get("name") or public_ip_id.rsplit("/", 1)[-1])
+        tags = public_ip.get("tags", {})
+        managed_by_tag = isinstance(tags, dict) and tags.get(MANAGED_PUBLIC_IP_TAG) == nic_name
+        managed_by_name = belongs_to_rotation_family(candidate_name, current_name)
+        if not managed_by_tag and not managed_by_name:
+            continue
+        if public_ip_association(public_ip):
+            continue
+        cleanup_unattached_public_ip(client, public_ip_id, "脚本遗留的未绑定公网 IP")
+
+
 def rotate_public_ip(client: AzureClient, resources: AzureResources) -> AzureResources:
+    cleanup_managed_public_ips(client, resources)
     old_public_ip = client.request("GET", resources.public_ip_id, NETWORK_API)
     new_id = replacement_id(resources.public_ip_id)
     new_name = new_id.rsplit("/", 1)[-1]
+    nic_name = resources.nic_id.rstrip("/").rsplit("/", 1)[-1]
     print(f"[{timestamp()}] 正在创建新公网 IP 资源：{new_name}", flush=True)
-    client.request("PUT", new_id, NETWORK_API, new_public_ip_body(old_public_ip))
-    new_public_ip = client.wait_for_resource(new_id, NETWORK_API)
-    new_address = new_public_ip.get("properties", {}).get("ipAddress")
-    if not isinstance(new_address, str) or not new_address:
-        raise MonitorError("新公网 IP 创建成功，但没有获得 IP 地址")
+    candidate_requested = False
+    new_address = ""
+    try:
+        candidate_requested = True
+        client.request("PUT", new_id, NETWORK_API, new_public_ip_body(old_public_ip, nic_name))
+        new_public_ip = client.wait_for_resource(new_id, NETWORK_API)
+        new_address = new_public_ip.get("properties", {}).get("ipAddress", "")
+        if not isinstance(new_address, str) or not new_address:
+            raise MonitorError("新公网 IP 创建成功，但没有获得 IP 地址")
 
-    print(f"[{timestamp()}] 新地址为 {new_address}，正在更新网卡绑定", flush=True)
-    bind_public_ip(client, resources, new_id)
+        print(f"[{timestamp()}] 新地址为 {new_address}，正在更新网卡绑定", flush=True)
+        bind_public_ip(client, resources, new_id)
+    except MonitorError:
+        candidate = optional_public_ip(client, new_id) if candidate_requested else None
+        expected_association = f"{resources.nic_id}/ipConfigurations/{resources.ip_config_name}"
+        candidate_association = public_ip_association(candidate or {})
+        candidate_address = (candidate or {}).get("properties", {}).get("ipAddress", "")
+        if (
+            candidate_association.lower() == expected_association.lower()
+            and isinstance(candidate_address, str)
+            and candidate_address
+        ):
+            new_address = candidate_address
+            print(
+                f"[{timestamp()}] 绑定验证请求异常，但候选公网 IP 已实际绑定，继续清理旧 IP",
+                flush=True,
+            )
+        else:
+            if candidate_requested:
+                cleanup_unattached_public_ip(client, new_id, "创建或绑定失败的候选公网 IP")
+            raise
+    except KeyboardInterrupt:
+        if candidate_requested:
+            cleanup_unattached_public_ip(client, new_id, "中断操作时未绑定的候选公网 IP")
+        raise
+
     print(
         f"[{timestamp()}] 新公网 IP 已绑定：{resources.public_ip_address} -> {new_address}",
         flush=True,
@@ -866,11 +1054,6 @@ def rotate_public_ip(client: AzureClient, resources: AzureResources) -> AzureRes
     delete_public_ip(client, resources.public_ip_id, "已解绑的前一个公网 IP")
     print(f"[{timestamp()}] 前一个公网 IP 已删除，仅保留当前新 IP", flush=True)
     return AzureResources(resources.nic_id, resources.ip_config_name, new_id, new_address)
-
-
-def delete_public_ip(client: AzureClient, public_ip_id: str, description: str) -> None:
-    print(f"[{timestamp()}] 正在删除{description}：{public_ip_id}", flush=True)
-    client.request("DELETE", public_ip_id, NETWORK_API)
 
 
 def tcp_check_once(timeout: int) -> bool:
@@ -914,6 +1097,8 @@ def rotate_until_reachable(
 
 def monitor(client: AzureClient, config: Config, once: bool = False) -> int:
     resources = discover_resources(client, config)
+    if not once:
+        cleanup_managed_public_ips(client, resources)
     cloudflare_synced_ip = ""
     if try_sync_cloudflare_dns(config, resources.public_ip_address):
         cloudflare_synced_ip = resources.public_ip_address

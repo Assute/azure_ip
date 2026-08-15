@@ -27,7 +27,9 @@ curl -fsSL https://raw.githubusercontent.com/Assute/azure_ip/main/azure_ip.sh | 
 - 自动识别 Azure 全球区和 Azure 中国区
 - 创建新 IP 时尽量保留原资源的 SKU、区域、可用区、标签和超时设置
 - 更新网卡公网 IP 时保留原有 NSG、DNS 和网卡功能设置，避免入站规则丢失
-- 新 IP 绑定验证成功后立即删除前一个公网 IP，始终只保留当前 IP
+- 新 IP 绑定验证成功后立即删除前一个公网 IP，删除失败时自动重试并等待 Azure 确认
+- 创建或绑定失败的候选 IP 会立即清理，服务启动时也会清理脚本遗留的未绑定 IP
+- 仅清理带脚本标记或明确属于当前轮换命名链的未绑定公网 IP，不影响其他资源
 - 支持单次检测和立即更换模式
 - 仅使用 Python 标准库，无需安装 Azure CLI 或第三方 Python 包
 
@@ -44,7 +46,8 @@ systemd 后台运行
                                            │
                                            └── 连续 3 次失败
                                                   ├── 创建并绑定新公网 IP
-                                                  ├── 立即删除前一个公网 IP
+                                                  ├── 创建/绑定失败：立即删除失败候选
+                                                  ├── 解绑旧 IP，重试删除并确认资源消失
                                                   ├── 等待 5 秒再次检测 TCP
                                                   ├── 检测失败：立即继续更换
                                                   └── 检测正常：同步 Cloudflare A 记录并恢复监控
@@ -123,18 +126,18 @@ sudo bash azure_ip.sh
 先确保 Azure 监控已经安装并生成配置文件，然后再次运行安装脚本，选择 `4. Cloudflare DDNS配置`。脚本会依次要求输入：
 
 ```text
-CFKEY=
-CFUSER=
-CFZONE_NAME=
-CFRECORD_NAME=
+CF密钥：
+用户名：
+域名：
 ```
 
-- `CFKEY`：Cloudflare 的 Global API Key，输入时不会回显。
-- `CFUSER`：Cloudflare 账号邮箱。
-- `CFZONE_NAME`：根域名，例如 `example.com`。
-- `CFRECORD_NAME`：可填写记录前缀 `www`、根记录 `@`，也可直接填写完整域名 `www.example.com`。
+- `CF密钥`：Cloudflare 的 Global API Key，输入时不会回显。
+- `用户名`：Cloudflare 账号邮箱。
+- `域名`：直接填写需要解析的完整域名，例如 `example.com`、`www.example.com` 或 `node.hk.example.com`。
 
-配置时会先验证 Cloudflare 凭据和 Zone，并把当前 Azure 公网 IP 写入 A 记录；记录不存在时自动创建，存在时只更新地址。后续 Azure 公网 IP 更换并通过 TCP 检测后，会自动同步 Cloudflare。同步失败不会触发再次换 IP，后台服务会在后续正常检测时继续重试。
+脚本会根据填写的完整域名逐级查找账号中最长匹配的 Cloudflare Zone，无需手动区分根域名和记录名称。例如填写 `node.hk.example.com` 时，会依次尝试匹配 `node.hk.example.com`、`hk.example.com` 和 `example.com`，找到可用 Zone 后自动解析记录名称。
+
+配置时会验证 Cloudflare 凭据和自动识别的 Zone，并把当前 Azure 公网 IP 写入 A 记录；记录不存在时自动创建，存在时只更新地址。后续 Azure 公网 IP 更换并通过 TCP 检测后，会自动同步 Cloudflare。同步失败不会触发再次换 IP，后台服务会在后续正常检测时继续重试。
 
 ## 管理命令
 
@@ -209,13 +212,13 @@ sudo systemctl stop azure-ip-monitor
 | `tcp_timeout` | `3` | 单次 TCP 连接超时时间，单位为秒 |
 | `check_interval` | `10` | 检测正常后到下一次常规检测的间隔，单位为秒；失败复检不等待 |
 | `failure_threshold` | `3` | 连续失败多少次后更换 IP |
-| `CFKEY` | 无 | Cloudflare Global API Key |
-| `CFUSER` | 无 | Cloudflare 账号邮箱 |
-| `CFZONE_NAME` | 无 | 托管在 Cloudflare 的根域名，例如 `example.com` |
-| `CFRECORD_NAME` | 无 | A 记录名称，可填 `www`、`@` 或完整域名 |
+| `CFKEY` | 无 | 交互输入的 Cloudflare 密钥 |
+| `CFUSER` | 无 | 交互输入的 Cloudflare 用户名（账号邮箱） |
+| `CFZONE_NAME` | 自动识别 | 根据填写的完整域名自动识别的 Zone |
+| `CFRECORD_NAME` | 无 | 交互输入的完整二级或三级域名 |
 
 
-常规检测一旦失败会立即进行下一次检测，不等待 `check_interval`；默认连续失败 `3` 次后开始更换公网 IP。每次创建的新公网 IP 绑定并验证成功后，脚本会立即删除前一个公网 IP，因此正常情况下始终只保留当前绑定的一个公网 IP。随后等待 `5` 秒进行 TCP 检测；检测失败就直接继续更换，检测正常则恢复常规监控。旧配置中的 `ping_timeout` 会自动作为 `tcp_timeout` 读取，旧的 `delete_old_ip` 字段会被忽略，无需重新配置。
+常规检测一旦失败会立即进行下一次检测，不等待 `check_interval`；默认连续失败 `3` 次后开始更换公网 IP。新公网 IP 会写入当前网卡名称标记，创建或绑定失败时立即清理；如果进程意外中断，服务下次启动或再次换 IP 前会清理带标记以及明确属于当前轮换命名链的未绑定遗留 IP。新 IP 绑定并验证成功后，脚本会等待旧 IP 完成解绑，最多重试 `5` 次删除并确认 Azure 资源已消失，因此正常情况下始终只保留当前绑定的一个公网 IP。随后等待 `5` 秒进行 TCP 检测；检测失败就直接继续更换，检测正常则恢复常规监控。旧配置中的 `ping_timeout` 会自动作为 `tcp_timeout` 读取，旧的 `delete_old_ip` 字段会被忽略，无需重新配置。
 
 修改配置后重启服务：
 
@@ -236,7 +239,7 @@ sudo systemctl restart azure-ip-monitor
 - 请确认服务器能解析并访问 `gd-cu-v4.ip.zstaticcdn.com:80`。目标服务故障、DNS 故障或出站防火墙拦截都会被判定为异常，并可能触发连续更换 IP。
 - 当前程序监控主网卡的主 IP 配置，暂不支持手动选择多个网卡或多个 IP 配置。
 - 更换的是 Azure 公网 IP 资源，不会修改虚拟机内部的私网 IP。
-- 如果域名直接解析到旧 IP，需要自行同步更新 DNS 记录。
+- 如果未启用 Cloudflare DDNS，域名解析到旧 IP 时需要自行同步更新 DNS 记录。
 - 创建公网 IP 可能产生 Azure 费用，具体以账号所在区域和订阅计费规则为准。
 - 更换过程中会创建带时间戳后缀的新公网 IP 资源名称。
 
