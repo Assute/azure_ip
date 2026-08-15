@@ -136,7 +136,8 @@ if [[ "${action}" == "delete-config" ]]; then
 fi
 
 require_command python3
-require_command ping
+require_command bash
+require_command timeout
 
 if command -v curl >/dev/null 2>&1; then
     downloader="curl"

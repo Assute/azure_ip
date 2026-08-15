@@ -2,7 +2,7 @@
 
 一个轻量、零第三方 Python 依赖的 Azure 虚拟机公网 IP 监控工具。
 
-程序会定时 Ping 指定虚拟机的公网 IP；当连续检测失败达到设定阈值后，自动创建新的 Azure 公网 IP、更新网卡绑定，并在确认切换成功后删除旧公网 IP 资源。
+程序会通过当前 Azure 公网 IP 定时检测 `gd-cu-v4.ip.zstaticcdn.com:80` 的 TCP 连通性；当连续检测失败达到设定阈值后，自动创建新的 Azure 公网 IP、更新网卡绑定，并在确认切换成功后删除旧公网 IP 资源。
 
 项目提供一键安装脚本，可自动将程序部署到 `/opt/azure_ip`，创建并启动 `systemd` 服务，使监控程序在后台持续运行并随系统启动。
 
@@ -19,9 +19,9 @@ curl -fsSL https://raw.githubusercontent.com/Assute/azure_ip/main/azure_ip.sh | 
 - 一条命令完成下载、配置、安装和后台启动
 - 自动部署到 `/opt/azure_ip`
 - 自动创建并启用 `systemd` 后台服务
-- 定时检测 Azure VM 公网 IP 的 ICMP 可达性
+- 使用 Bash `/dev/tcp` 检测 `gd-cu-v4.ip.zstaticcdn.com:80` 的 TCP 连通性
 - 常规监控连续失败达到阈值后自动更换公网 IP
-- 新 IP 绑定后等待 2 秒检测，失败一次立即继续更换，直到恢复正常
+- 新 IP 绑定后等待 2 秒检测 TCP，失败一次立即继续更换，直到恢复正常
 - 自动发现订阅、资源组、虚拟机、主网卡和公网 IP
 - 自动识别 Azure 全球区和 Azure 中国区
 - 创建新 IP 时尽量保留原资源的 SKU、区域、可用区、标签和超时设置
@@ -34,29 +34,29 @@ curl -fsSL https://raw.githubusercontent.com/Assute/azure_ip/main/azure_ip.sh | 
 ```text
 systemd 后台运行
        │
-       └── 定时检测当前公网 IP
+       └── TCP 检测 gd-cu-v4.ip.zstaticcdn.com:80
                     │
-                    ├── Ping 正常 ──> 清零失败次数
+                    ├── 连接正常 ──> 清零失败次数并继续检测
                     │
-                    └── Ping 超时 ──> 累计失败次数
+                    └── 连接超时 ──> 累计失败次数
                                            │
                                            └── 达到阈值
-                                                  ├── 创建新公网 IP
-                                                  ├── 更新 VM 主网卡绑定
-                                                  ├── 验证新 IP 已绑定
-                                                  └── 删除或保留旧 IP
+                                                  ├── 创建并绑定新公网 IP
+                                                  ├── 等待 2 秒再次检测 TCP
+                                                  ├── 超时一次立即继续换 IP
+                                                  └── 正常后恢复常规检测
 ```
 
 ## 环境要求
 
 - 使用 `systemd` 的 Linux 系统
 - Python 3.10 或更高版本
-- 系统已安装 `ping` 命令
+- 系统已安装 `bash` 和 GNU `timeout` 命令
 - 系统已安装 `curl` 或 `wget`
 - 可访问 GitHub、Azure 登录端点和 Azure Resource Manager API
 - Azure VM 已绑定独立的公网 IPv4 地址
 
-> 当前 Ping 参数按 Linux `iputils` 编写，不适用于 Windows 原生命令行。
+> 实际检测命令为 `timeout 3 bash -c '</dev/tcp/gd-cu-v4.ip.zstaticcdn.com/80'`，因此需要 Bash 支持 `/dev/tcp`。
 
 ## Azure 权限准备
 
@@ -91,7 +91,7 @@ sudo bash azure_ip.sh
 
 首次运行时，安装脚本会：
 
-1. 检查 `python3`、`ping`、`systemctl`、`curl` 或 `wget`。
+1. 检查 `python3`、`bash`、`timeout`、`systemctl`、`curl` 或 `wget`。
 2. 下载最新版程序到 `/opt/azure_ip`。
 3. 提示输入 Azure 应用凭据。
 4. 自动识别 Azure 全球区或中国区。
@@ -182,7 +182,7 @@ sudo systemctl stop azure-ip-monitor
 
 | 字段 | 默认值 | 说明 |
 | --- | ---: | --- |
-| `ping_timeout` | `3` | 单次 Ping 超时时间，单位为秒 |
+| `tcp_timeout` | `3` | 单次 TCP 连接超时时间，单位为秒 |
 | `check_interval` | `10` | 两次检测之间的间隔，单位为秒 |
 | `failure_threshold` | `3` | 连续失败多少次后更换 IP |
 | `delete_old_ip` | `true` | 切换成功后是否删除旧公网 IP 资源 |
@@ -193,7 +193,7 @@ sudo systemctl stop azure-ip-monitor
 "delete_old_ip": false
 ```
 
-公网 IP 更换后的恢复检测固定等待 `2` 秒，不受配置文件控制。新 IP 如果第一次 Ping 就超时，程序会立即继续创建并切换下一个 IP，直到检测正常，然后恢复上表所示的常规检测间隔和失败阈值。
+公网 IP 更换后的恢复检测固定等待 `2` 秒，不受配置文件控制。新 IP 如果第一次连接 `gd-cu-v4.ip.zstaticcdn.com:80` 就超时，程序会立即继续创建并切换下一个 IP，直到 TCP 检测正常，然后恢复上表所示的常规检测间隔和失败阈值。旧配置中的 `ping_timeout` 会自动作为 `tcp_timeout` 读取，无需重新配置。
 
 修改配置后重启服务：
 
@@ -211,7 +211,7 @@ sudo systemctl restart azure-ip-monitor
 
 ## 注意事项
 
-- 请先确认虚拟机和网络安全组允许 ICMP。若服务器主动禁用 Ping，程序会将其判断为故障并更换 IP。
+- 请确认服务器能解析并访问 `gd-cu-v4.ip.zstaticcdn.com:80`。目标服务故障、DNS 故障或出站防火墙拦截都会被判定为异常，并可能触发连续更换 IP。
 - 当前程序监控主网卡的主 IP 配置，暂不支持手动选择多个网卡或多个 IP 配置。
 - 更换的是 Azure 公网 IP 资源，不会修改虚拟机内部的私网 IP。
 - 如果域名直接解析到旧 IP，需要自行同步更新 DNS 记录。

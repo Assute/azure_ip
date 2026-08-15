@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor an Azure VM public IP and replace it after repeated ping failures."""
+"""Monitor TCP connectivity and rotate an Azure VM public IP after repeated failures."""
 
 from __future__ import annotations
 
@@ -26,6 +26,8 @@ COMPUTE_API = "2024-11-01"
 NETWORK_API = "2024-05-01"
 SUBSCRIPTIONS_API = "2022-12-01"
 POST_ROTATION_CHECK_DELAY = 2
+TCP_CHECK_HOST = "gd-cu-v4.ip.zstaticcdn.com"
+TCP_CHECK_PORT = 80
 
 CLOUDS = {
     "global": {
@@ -54,7 +56,7 @@ class Config:
     subscription_id: str
     resource_group: str
     vm_name: str
-    ping_timeout: int = 3
+    tcp_timeout: int = 3
     check_interval: int = 10
     failure_threshold: int = 3
     delete_old_ip: bool = True
@@ -83,7 +85,7 @@ class Config:
             subscription_id=str(data["subscription_id"]),
             resource_group=str(data["resource_group"]),
             vm_name=str(data["vm_name"]),
-            ping_timeout=positive_int(data.get("ping_timeout", 3), "ping_timeout"),
+            tcp_timeout=positive_int(data.get("tcp_timeout", data.get("ping_timeout", 3)), "tcp_timeout"),
             check_interval=positive_int(data.get("check_interval", 10), "check_interval"),
             failure_threshold=positive_int(data.get("failure_threshold", 3), "failure_threshold"),
             delete_old_ip=bool(data.get("delete_old_ip", True)),
@@ -162,7 +164,10 @@ def configure(path: Path) -> Config:
         f"已选择：{choice.vm_name} / {choice.resource_group} / "
         f"{choice.subscription_name} / {choice.public_ip_address}"
     )
-    print("监控参数：每 10 秒检测，单次超时 3 秒，连续失败 3 次后更换 IP；换 IP 后每 2 秒验证，失败一次立即继续更换。")
+    print(
+        f"监控参数：每 10 秒检测 TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT}，单次超时 3 秒，"
+        "连续失败 3 次后更换 IP；换 IP 后每 2 秒验证，失败一次立即继续更换。"
+    )
     print(f"配置已保存到 {path}（权限 600）。")
     return config
 
@@ -177,7 +182,7 @@ def save_config(path: Path, config: Config) -> None:
         "subscription_id": config.subscription_id,
         "resource_group": config.resource_group,
         "vm_name": config.vm_name,
-        "ping_timeout": config.ping_timeout,
+        "tcp_timeout": config.tcp_timeout,
         "check_interval": config.check_interval,
         "failure_threshold": config.failure_threshold,
         "delete_old_ip": config.delete_old_ip,
@@ -617,8 +622,14 @@ def rotate_public_ip(client: AzureClient, resources: AzureResources, delete_old:
     return AzureResources(resources.nic_id, resources.ip_config_name, new_id, new_address)
 
 
-def ping_once(address: str, timeout: int) -> bool:
-    command = ["ping", "-n", "-c", "1", "-W", str(timeout), address]
+def tcp_check_once(timeout: int) -> bool:
+    command = [
+        "timeout",
+        str(timeout),
+        "bash",
+        "-c",
+        f"</dev/tcp/{TCP_CHECK_HOST}/{TCP_CHECK_PORT}",
+    ]
     result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     return result.returncode == 0
 
@@ -631,19 +642,21 @@ def rotate_until_reachable(
     while True:
         resources = rotate_public_ip(client, resources, config.delete_old_ip)
         print(
-            f"[{timestamp()}] 等待 {POST_ROTATION_CHECK_DELAY} 秒后检测新公网 IP；"
-            "如超时将立即继续更换",
+            f"[{timestamp()}] 等待 {POST_ROTATION_CHECK_DELAY} 秒后通过新公网 IP 检测 "
+            f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT}；如超时将立即继续更换",
             flush=True,
         )
         time.sleep(POST_ROTATION_CHECK_DELAY)
-        if ping_once(resources.public_ip_address, config.ping_timeout):
+        if tcp_check_once(config.tcp_timeout):
             print(
-                f"[{timestamp()}] 新公网 IP {resources.public_ip_address} 检测正常，恢复常规监控",
+                f"[{timestamp()}] 新公网 IP {resources.public_ip_address} 访问 "
+                f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT} 正常，恢复常规监控",
                 flush=True,
             )
             return resources
         print(
-            f"[{timestamp()}] 新公网 IP {resources.public_ip_address} Ping 超时，立即继续更换",
+            f"[{timestamp()}] 新公网 IP {resources.public_ip_address} 访问 "
+            f"TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT} 超时，立即继续更换",
             flush=True,
         )
         resources = discover_resources(client, config)
@@ -653,19 +666,24 @@ def monitor(client: AzureClient, config: Config, once: bool = False, dry_run: bo
     resources = discover_resources(client, config)
     print(
         f"[{timestamp()}] 开始监控 {config.vm_name}，当前公网 IP：{resources.public_ip_address}；"
+        f"检测目标 TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT}，"
         f"连续失败 {config.failure_threshold} 次后更换",
         flush=True,
     )
     failures = 0
     while True:
-        reachable = ping_once(resources.public_ip_address, config.ping_timeout)
+        reachable = tcp_check_once(config.tcp_timeout)
         if reachable:
             failures = 0
-            print(f"[{timestamp()}] {resources.public_ip_address} 正常", flush=True)
+            print(
+                f"[{timestamp()}] TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT} 正常 "
+                f"（当前公网 IP：{resources.public_ip_address}）",
+                flush=True,
+            )
         else:
             failures += 1
             print(
-                f"[{timestamp()}] {resources.public_ip_address} Ping 超时 "
+                f"[{timestamp()}] TCP {TCP_CHECK_HOST}:{TCP_CHECK_PORT} 超时 "
                 f"({failures}/{config.failure_threshold})",
                 flush=True,
             )
@@ -686,7 +704,7 @@ def monitor(client: AzureClient, config: Config, once: bool = False, dry_run: bo
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Azure 公网 IP 故障监控与自动更换")
+    parser = argparse.ArgumentParser(description="Azure TCP 连通性监控与公网 IP 自动更换")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="配置文件路径")
     parser.add_argument("--configure", action="store_true", help="重新填写并保存配置")
     parser.add_argument("--configure-only", action="store_true", help="完成配置后退出，不启动监控")
@@ -698,8 +716,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if shutil.which("ping") is None:
-        print("错误：系统缺少 ping 命令", file=sys.stderr)
+    missing_commands = [name for name in ("bash", "timeout") if shutil.which(name) is None]
+    if missing_commands:
+        print(f"错误：系统缺少命令：{', '.join(missing_commands)}", file=sys.stderr)
         return 2
 
     try:
