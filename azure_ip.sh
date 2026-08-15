@@ -127,7 +127,7 @@ fi
 require_command systemctl
 
 if [[ "${action}" == "install" && -f "${CONFIG_FILE}" ]]; then
-    if [[ -t 0 ]] && has_interactive_tty; then
+    if [[ -t 1 || -t 2 ]] && has_interactive_tty; then
         choose_existing_config_action
     else
         echo "检测到现有配置，非交互运行将保留配置并继续更新。"
