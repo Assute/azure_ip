@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/Assute/azure_ip/main/azure_ip.sh | 
 - 自动识别 Azure 全球区和 Azure 中国区
 - 创建新 IP 时尽量保留原资源的 SKU、区域、可用区、标签和超时设置
 - 新 IP 绑定验证成功后再删除旧 IP，降低误删除风险
-- 支持保留旧公网 IP、单次检测、立即更换和演练模式
+- 支持保留旧公网 IP、单次检测和立即更换模式
 - 仅使用 Python 标准库，无需安装 Azure CLI 或第三方 Python 包
 
 ## 工作流程
@@ -151,7 +151,6 @@ journalctl -u azure-ip-monitor -f
 --configure-only    完成配置后退出，不启动监控
 --once              只检测一次，不自动更换 IP
 --rotate-now        立即更换当前公网 IP
---dry-run           达到失败阈值时只提示，不修改 Azure 资源
 ```
 
 使用示例：
@@ -161,9 +160,6 @@ journalctl -u azure-ip-monitor -f
 sudo python3 /opt/azure_ip/azure_ip_monitor.py \
   --config /opt/azure_ip/azure_ip_monitor.json --once
 
-# 测试监控逻辑，但不修改 Azure 资源
-sudo python3 /opt/azure_ip/azure_ip_monitor.py \
-  --config /opt/azure_ip/azure_ip_monitor.json --dry-run
 
 # 立即创建并切换到新公网 IP
 sudo python3 /opt/azure_ip/azure_ip_monitor.py \
@@ -232,4 +228,4 @@ sudo systemctl restart azure-ip-monitor
 
 ## 免责声明
 
-本项目用于自动化运维和故障恢复。请在充分了解 Azure 网络资源、权限和计费规则后使用。生产环境部署前，建议先通过 `--once` 和 `--dry-run` 验证配置与检测逻辑。
+本项目用于自动化运维和故障恢复。请在充分了解 Azure 网络资源、权限和计费规则后使用。生产环境部署前，建议先通过 `--once` 验证配置和 TCP 检测逻辑。

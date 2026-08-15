@@ -662,7 +662,7 @@ def rotate_until_reachable(
         resources = discover_resources(client, config)
 
 
-def monitor(client: AzureClient, config: Config, once: bool = False, dry_run: bool = False) -> int:
+def monitor(client: AzureClient, config: Config, once: bool = False) -> int:
     resources = discover_resources(client, config)
     print(
         f"[{timestamp()}] 开始监控 {config.vm_name}，当前公网 IP：{resources.public_ip_address}；"
@@ -692,13 +692,9 @@ def monitor(client: AzureClient, config: Config, once: bool = False, dry_run: bo
             return 0 if reachable else 1
 
         if failures >= config.failure_threshold:
-            if dry_run:
-                print(f"[{timestamp()}] [演练] 已达到阈值，本应更换公网 IP；未修改 Azure 资源", flush=True)
-                failures = 0
-            else:
-                resources = discover_resources(client, config)
-                resources = rotate_until_reachable(client, config, resources)
-                failures = 0
+            resources = discover_resources(client, config)
+            resources = rotate_until_reachable(client, config, resources)
+            failures = 0
 
         time.sleep(config.check_interval)
 
@@ -710,7 +706,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--configure-only", action="store_true", help="完成配置后退出，不启动监控")
     parser.add_argument("--once", action="store_true", help="只检测一次，不更换 IP")
     parser.add_argument("--rotate-now", action="store_true", help="立即更换公网 IP")
-    parser.add_argument("--dry-run", action="store_true", help="达到阈值时只提示，不修改 Azure 资源")
     return parser.parse_args()
 
 
@@ -732,7 +727,7 @@ def main() -> int:
             print(f"当前公网 IP：{resources.public_ip_address}")
             rotate_until_reachable(client, config, resources)
             return 0
-        return monitor(client, config, once=args.once, dry_run=args.dry_run)
+        return monitor(client, config, once=args.once)
     except KeyboardInterrupt:
         print("\n监控已停止。")
         return 130
